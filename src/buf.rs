@@ -52,6 +52,7 @@ impl BufferHead {
 
     pub fn sync(&mut self) {
         if self.dirty {
+            // FIXME: different block sizes?
             self.device.write_block(self.block_id, self.buf());
         }
         self.dirty = false;

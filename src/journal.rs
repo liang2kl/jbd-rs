@@ -28,8 +28,6 @@ bitflags! {
 pub struct Journal {
     buf_provider: Box<dyn BufferProvider>,
     // TODO: j_inode, j_task, j_commit_timer, j_last_sync_writer, j_private
-    flags: JournalFlag,
-    err: Option<JBDError>,
     sb_buffer: Arc<Mutex<BufferHead>>,
     // superblock: Superblock,
     format_version: i32,
@@ -61,6 +59,8 @@ struct JournalDevs {
 
 /// Journal states protected by a single spin lock in Linux.
 struct JournalStates {
+    flags: JournalFlag,
+    errno: u32, // TODO: Strongly-typed error?
     running_transaction: Option<Arc<Transaction>>,
     committing_transaction: Option<Arc<Transaction>>,
     head: u32,
@@ -97,6 +97,34 @@ struct JournalRevokeTables {
 
 struct RevokeTable;
 
+#[derive(Clone, Copy, Debug)]
+enum RecoveryPassType {
+    Scan,
+    Revoke,
+    Replay,
+}
+
+struct RecoveryInfo {
+    start_transaction: Tid,
+    end_transaction: Tid,
+    num_replays: usize,
+    num_revokes: usize,
+    num_revoke_hits: usize,
+}
+
+impl RecoveryInfo {
+    fn zero_init() -> Self {
+        Self {
+            start_transaction: 0,
+            end_transaction: 0,
+            num_replays: 0,
+            num_revokes: 0,
+            num_revoke_hits: 0,
+        }
+    }
+}
+
+/// Public interfaces.
 impl Journal {
     pub fn init_dev(
         buf_provider: Box<dyn BufferProvider>,
@@ -135,16 +163,139 @@ impl Journal {
         Self::init_dev(provider, dev, fs_dev, start, len)
     }
 
+    pub fn create(&mut self) -> JBDResult {
+        if self.maxlen < JFS_MIN_JOURNAL_BLOCKS {
+            log::error!("Journal too small: {} blocks.", self.maxlen);
+            return Err(JBDError::InvalidJournalSize);
+        }
+
+        // TODO: j_inode
+        log::debug!("Zeroing out journal blocks.");
+        for i in 0..self.maxlen {
+            let block_id = self.bmap(i)?;
+            let page_head_locked = self.buf_provider.get_buffer(self.devs.dev.clone(), block_id as usize)?;
+            let mut page_head = page_head_locked.lock();
+            let buf = page_head.buf_mut();
+            buf.fill(0);
+            // TODO: What is set_buffer_uptodate?
+            // No need to __brelse, as rust has done the ref count for us :)
+        }
+
+        self.buf_provider.sync()?;
+        log::debug!("Journal cleared.");
+
+        let mut sb_guard = self.sb_buffer.lock();
+        let sb = Self::superblock_mut(&mut sb_guard);
+
+        sb.header.magic = JFS_MAGIC_NUMBER.to_be();
+        sb.header.block_type = <BlockType as Into<u32>>::into(BlockType::SuperblockV2).to_be();
+
+        sb.block_size = (self.devs.dev.block_size() as u32).to_be();
+        sb.maxlen = self.maxlen.to_be();
+        sb.first = 1_u32.to_be();
+        drop(sb_guard);
+
+        let mut states = self.states.lock();
+        states.transaction_sequence = 1;
+
+        states.flags.remove(JournalFlag::ABORT);
+        drop(states);
+
+        self.format_version = 2;
+
+        self.reset()
+    }
+
+    pub fn load(&mut self) -> JBDResult {
+        self.load_superblock()?;
+
+        // TODO: check features
+
+        // FIXME: Do we need to follow the same errno here?
+        self.recover()?;
+        self.reset()?;
+
+        let mut states = self.states.lock();
+        states.flags.remove(JournalFlag::ABORT);
+        states.flags.insert(JournalFlag::LOADED);
+
+        Ok(())
+    }
+
+    pub fn recover(&mut self) -> JBDResult {
+        todo!()
+    }
+
+    /// Wipe out all of the contents of a journal, safely.  This will produce
+    /// a warning if the journal contains any valid recovery information.
+    /// Must be called between Journal::init_*() and Journal::load().
+    ///
+    /// If 'write' is true, then we wipe out the journal on disk; otherwise
+    /// we merely suppress recovery.
+    pub fn wipe(&mut self, write: bool) -> JBDResult {
+        self.load_superblock()?;
+
+        let states = self.states.lock();
+        if states.tail == 0 {
+            return Ok(());
+        }
+        drop(states);
+
+        log::warn!(
+            "{} recovery information on journal.",
+            if write { "Clearing" } else { "Ignoring" }
+        );
+
+        // TODO: 1546
+
+        Ok(())
+    }
+
+    /// Locate any valid recovery information from the journal and set up the
+    /// journal structures in memory to ignore it (presumably because the
+    /// caller has evidence that it is out of date).
+    /// This function does'nt appear to be exorted..
+    ///
+    /// We perform one pass over the journal to allow us to tell the user how
+    /// much recovery information is being erased, and to let us initialise
+    /// the journal transaction sequence numbers to the next unused ID.
+    pub fn skip_recovery(&mut self) -> JBDResult {
+        let rec_res = self.recovery_one_pass(RecoveryPassType::Scan);
+        let mut states = self.states.lock();
+        let sb_guard = self.sb_buffer.lock();
+        let sb = Self::superblock_ref(&sb_guard);
+
+        match rec_res {
+            Ok(info) => {
+                let dropped = info.end_transaction as isize - u32::from_be(sb.header.sequence) as isize;
+                log::debug!("Ignoring {} transactions from the journal.", dropped);
+                states.transaction_sequence = info.end_transaction + 1;
+            }
+            Err(e) => {
+                log::error!("Error scanning journal: {:?}", e);
+                states.transaction_sequence += 1;
+                return Err(e);
+            }
+        }
+
+        states.tail = 0;
+
+        Ok(())
+    }
+}
+
+/// Internal helper functions.
+impl Journal {
     fn init_common(provider: Box<dyn BufferProvider>, devs: JournalDevs) -> Self {
         let mut provider = provider;
         let sb_buffer = provider.get_buffer(devs.dev.clone(), devs.blk_offset as usize).unwrap();
         Self {
             buf_provider: provider,
-            flags: JournalFlag::ABORT,
-            err: None,
             sb_buffer,
             format_version: 0,
             states: Mutex::new(JournalStates {
+                flags: JournalFlag::ABORT,
+                errno: 0,
                 running_transaction: None,
                 committing_transaction: None,
                 head: 0,
@@ -176,46 +327,9 @@ impl Journal {
         }
     }
 
-    pub fn create(&mut self) -> JBDResult {
-        if self.maxlen < JFS_MIN_JOURNAL_BLOCKS {
-            log::error!("Journal too small: {} blocks.", self.maxlen);
-            return Err(JBDError::InvalidJournalSize);
-        }
-
+    fn bmap(&self, block_id: u32) -> JBDResult<u32> {
         // TODO: j_inode
-        log::debug!("Zeroing out journal blocks.");
-        for i in 0..self.maxlen {
-            let block_id = self.bmap(i)?;
-            let page_head_locked = self.buf_provider.get_buffer(self.devs.dev.clone(), block_id as usize)?;
-            let mut page_head = page_head_locked.lock();
-            let buf = page_head.buf_mut();
-            buf.fill(0);
-            // TODO: What is set_buffer_uptodate?
-            // No need to __brelse, as rust has done the ref count for us :)
-        }
-
-        self.buf_provider.sync()?;
-        log::debug!("Journal cleared.");
-
-        let mut sb_guard = self.sb_buffer.lock();
-        let sb = Self::superblock_mut(&mut sb_guard);
-
-        sb.header.magic = JFS_MAGIC_NUMBER.to_be();
-        sb.header.block_type = BlockType::SUPERBLOCK_V2.to_u32().to_be();
-
-        sb.block_size = (self.devs.dev.block_size() as u32).to_be();
-        sb.maxlen = self.maxlen.to_be();
-        sb.first = 1_u32.to_be();
-        drop(sb_guard);
-
-        let mut states = self.states.lock();
-        states.transaction_sequence = 1;
-        drop(states);
-
-        self.flags &= !JournalFlag::ABORT; // TODO: Check
-        self.format_version = 2;
-
-        self.reset()
+        Ok(block_id)
     }
 
     /// Given a journal_t structure, initialize the various fields for
@@ -253,19 +367,98 @@ impl Journal {
 
         self.update_superblock();
 
-        Ok(())
+        Ok(()) // FIXME: Should start deamon thread here.
     }
-}
 
-impl Journal {
-    fn bmap(&self, block_id: u32) -> JBDResult<u32> {
-        // TODO: j_inode
-        Ok(block_id)
+    /// Load the on-disk journal superblock and read the key fields.
+    fn load_superblock(&mut self) -> JBDResult {
+        self.validate_superblock()?;
+
+        let sb_guard = self.sb_buffer.lock();
+        let sb = Self::superblock_ref(&sb_guard);
+        let mut states = self.states.lock();
+
+        states.tail_sequence = u32::from_be(sb.sequence) as u16;
+        states.tail = u32::from_be(sb.start);
+        states.first = u32::from_be(sb.first);
+        states.last = u32::from_be(sb.maxlen);
+        states.errno = u32::from_be(sb.errno);
+
+        Ok(())
     }
 
     /// Update a journal's dynamic superblock fields and write it to disk,
     /// ~~optionally waiting for the IO to complete~~.
-    fn update_superblock(&mut self) {}
+    fn update_superblock(&mut self) {
+        let mut sb_guard = self.sb_buffer.lock();
+        let sb = Self::superblock_mut(&mut sb_guard);
+        let mut states = self.states.lock();
+
+        if sb.start == 0 && states.tail_sequence == states.transaction_sequence {
+            log::debug!("Skipping superblock update on newly created / recovered journal.");
+            states.flags.insert(JournalFlag::FLUSHED);
+            return;
+        }
+
+        // TODO: buffer_write_io_error
+
+        log::debug!("Updating superblock.");
+        sb.sequence = (states.tail_sequence as u32).to_be();
+        sb.start = states.tail.to_be();
+        sb.errno = states.errno;
+        // drop(states);
+
+        // No need to mark dirty here, as superblock_mut has already set that.
+        // TODO: Non-blocking I/O; trace_jbd_update_superblock_end (what is this?)
+
+        if sb.start != 0 {
+            states.flags.insert(JournalFlag::FLUSHED);
+        } else {
+            states.flags.remove(JournalFlag::FLUSHED);
+        }
+    }
+
+    fn validate_superblock(&mut self) -> JBDResult {
+        // No need to test buffer_uptodate here as in our implementation as far,
+        // the buffer will always be valid.
+        let sb_guard = self.sb_buffer.lock();
+        let sb = Self::superblock_ref(&sb_guard);
+
+        if sb.header.magic != JFS_MAGIC_NUMBER.to_be() || sb.block_size != (self.devs.dev.block_size() as u32).to_be() {
+            log::error!("Invalid journal superblock magic number or block size.");
+            return Err(JBDError::InvalidSuperblock);
+        }
+
+        let block_type: BlockType = u32::from_be(sb.header.block_type).try_into()?;
+
+        match block_type {
+            BlockType::SuperblockV1 => self.format_version = 1,
+            BlockType::SuperblockV2 => self.format_version = 2,
+            _ => {
+                log::error!("Invalid journal superblock block type.");
+                return Err(JBDError::InvalidSuperblock);
+            }
+        }
+
+        if u32::from_be(sb.maxlen) <= self.maxlen {
+            self.maxlen = u32::from_be(sb.maxlen);
+        } else {
+            log::error!("Journal too short.");
+            // Linux returns -EINVAL here, so as we.
+            return Err(JBDError::InvalidSuperblock);
+        }
+
+        if u32::from_be(sb.first) == 0 || u32::from_be(sb.first) >= self.maxlen {
+            log::error!("Journal has invalid start block.");
+            return Err(JBDError::InvalidSuperblock);
+        }
+
+        Ok(())
+    }
+
+    fn recovery_one_pass(&mut self, pass_type: RecoveryPassType) -> JBDResult<RecoveryInfo> {
+        todo!()
+    }
 
     fn superblock_ref<'a>(buf: &'a MutexGuard<BufferHead>) -> &'a Superblock {
         buf.convert::<Superblock>()

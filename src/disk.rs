@@ -2,19 +2,35 @@
 
 use bitflags::bitflags;
 
+use crate::err::{JBDError, JBDResult};
+
 /// Descriptor block types.
 #[derive(Clone, Copy)]
 pub enum BlockType {
-    DESCRIPTOR_BLOCK = 1,
-    COMMIT_BLOCK = 2,
-    SUPERBLOCK_V1 = 3,
-    SUPERBLOCK_V2 = 4,
-    REVOKE_BLOCK = 5,
+    DescriptorBlock = 1,
+    CommitBlock = 2,
+    SuperblockV1 = 3,
+    SuperblockV2 = 4,
+    Revokeblock = 5,
 }
 
-impl BlockType {
-    pub fn to_u32(&self) -> u32 {
-        *self as u32
+impl Into<u32> for BlockType {
+    fn into(self) -> u32 {
+        self as u32
+    }
+}
+
+impl TryFrom<u32> for BlockType {
+    type Error = JBDError;
+    fn try_from(value: u32) -> JBDResult<Self> {
+        match value {
+            1 => Ok(BlockType::DescriptorBlock),
+            2 => Ok(BlockType::CommitBlock),
+            3 => Ok(BlockType::SuperblockV1),
+            4 => Ok(BlockType::SuperblockV2),
+            5 => Ok(BlockType::Revokeblock),
+            _ => Err(JBDError::InvalidSuperblock),
+        }
     }
 }
 
