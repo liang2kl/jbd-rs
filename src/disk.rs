@@ -89,7 +89,7 @@ pub struct Superblock {
 
     /* Error value, as set by journal_abort(). */
     // TODO: enum?
-    pub errno: u32,
+    pub errno: i32,
 
     /* Remaining fields are only valid in a version-2 superblock */
     /// Compatible feature set

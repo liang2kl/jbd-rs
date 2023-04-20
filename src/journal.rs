@@ -60,7 +60,7 @@ struct JournalDevs {
 /// Journal states protected by a single spin lock in Linux.
 struct JournalStates {
     flags: JournalFlag,
-    errno: u32, // TODO: Strongly-typed error?
+    errno: i32, // TODO: Strongly-typed error?
     running_transaction: Option<Arc<Transaction>>,
     committing_transaction: Option<Arc<Transaction>>,
     head: u32,
@@ -97,7 +97,7 @@ struct JournalRevokeTables {
 
 struct RevokeTable;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryPassType {
     Scan,
     Revoke,
@@ -132,24 +132,19 @@ impl Journal {
         fs_dev: Arc<dyn BlockDevice>,
         start: u32,
         len: u32,
-    ) -> Self {
+    ) -> JBDResult<Self> {
         let devs = JournalDevs {
             dev,
             blk_offset: start,
             fs_dev,
         };
-        let mut journal = Self::init_common(buf_provider, devs);
+        let mut journal = Self::init_common(buf_provider, devs)?;
 
         let n_blks = journal.devs.dev.block_size() / size_of::<BlockTag>();
         journal.wbuf.resize(n_blks, None);
         journal.maxlen = len;
 
-        journal.sb_buffer = journal
-            .buf_provider
-            .get_buffer(journal.devs.dev.clone(), start as usize)
-            .unwrap();
-
-        journal
+        Ok(journal)
     }
 
     pub fn init_dev_default(
@@ -158,7 +153,7 @@ impl Journal {
         start: u32,
         len: u32,
         block_size: u32,
-    ) -> Self {
+    ) -> JBDResult<Self> {
         let provider = Box::new(DefaultBufferProvider::new());
         Self::init_dev(provider, dev, fs_dev, start, len)
     }
@@ -246,7 +241,8 @@ impl Journal {
             if write { "Clearing" } else { "Ignoring" }
         );
 
-        // TODO: 1546
+        self.skip_recovery()?;
+        self.update_superblock();
 
         Ok(())
     }
@@ -260,7 +256,7 @@ impl Journal {
     /// much recovery information is being erased, and to let us initialise
     /// the journal transaction sequence numbers to the next unused ID.
     pub fn skip_recovery(&mut self) -> JBDResult {
-        let rec_res = self.recovery_one_pass(RecoveryPassType::Scan);
+        let rec_res = self.recover_one_pass(RecoveryPassType::Scan);
         let mut states = self.states.lock();
         let sb_guard = self.sb_buffer.lock();
         let sb = Self::superblock_ref(&sb_guard);
@@ -282,14 +278,85 @@ impl Journal {
 
         Ok(())
     }
+
+    /// Perform a complete, immediate shutdown of the ENTIRE
+    /// journal (not of a single transaction).  This operation cannot be
+    /// undone without closing and reopening the journal.
+    ///
+    /// The journal_abort function is intended to support higher level error
+    /// recovery mechanisms such as the ext2/ext3 remount-readonly error
+    /// mode.
+    ///
+    /// Journal abort has very specific semantics.  Any existing dirty,
+    /// unjournaled buffers in the main filesystem will still be written to
+    /// disk by bdflush, but the journaling mechanism will be suspended
+    /// immediately and no further transaction commits will be honoured.
+    ///
+    /// Any dirty, journaled buffers will be written back to disk without
+    /// hitting the journal.  Atomicity cannot be guaranteed on an aborted
+    /// filesystem, but we _do_ attempt to leave as much data as possible
+    /// behind for fsck to use for cleanup.
+    ///
+    /// Any attempt to get a new transaction handle on a journal which is in
+    /// ABORT state will just result in an -EROFS error return.  A
+    /// journal_stop on an existing handle will return -EIO if we have
+    /// entered abort state during the update.
+    ///
+    /// Recursive transactions are not disturbed by journal abort until the
+    /// final journal_stop, which will receive the -EIO error.
+    ///
+    /// Finally, the journal_abort call allows the caller to supply an errno
+    /// which will be recorded (if possible) in the journal superblock.  This
+    /// allows a client to record failure conditions in the middle of a
+    /// transaction without having to complete the transaction to record the
+    /// failure to disk.  ext3_error, for example, now uses this
+    /// functionality.
+    ///
+    /// Errors which originate from within the journaling layer will NOT
+    /// supply an errno; a null errno implies that absolutely no further
+    /// writes are done to the journal (unless there are any already in
+    /// progress).
+    pub fn abort(&mut self, errno: i32) {
+        self.abort_soft(errno);
+    }
+
+    pub fn errno(&self) -> i32 {
+        let states = self.states.lock();
+        if states.flags.contains(JournalFlag::ABORT) {
+            const EROFS: i32 = -30;
+            -EROFS
+        } else {
+            states.errno
+        }
+    }
+
+    pub fn clear_err(&mut self) -> i32 {
+        let mut states = self.states.lock();
+        if states.flags.contains(JournalFlag::ABORT) {
+            const EROFS: i32 = -30;
+            -EROFS
+        } else {
+            states.errno = 0;
+            0
+        }
+    }
+
+    pub fn ack_err(&mut self) {
+        let mut states = self.states.lock();
+        if states.errno != 0 {
+            states.flags.insert(JournalFlag::ACK_ERR);
+        }
+    }
+
+    // TODO: journal_blocks_per_page, ...
 }
 
 /// Internal helper functions.
 impl Journal {
-    fn init_common(provider: Box<dyn BufferProvider>, devs: JournalDevs) -> Self {
+    fn init_common(provider: Box<dyn BufferProvider>, devs: JournalDevs) -> JBDResult<Self> {
         let mut provider = provider;
-        let sb_buffer = provider.get_buffer(devs.dev.clone(), devs.blk_offset as usize).unwrap();
-        Self {
+        let sb_buffer = provider.get_buffer(devs.dev.clone(), devs.blk_offset as usize)?;
+        let ret = Self {
             buf_provider: provider,
             sb_buffer,
             format_version: 0,
@@ -324,7 +391,8 @@ impl Journal {
             max_transaction_buffers: 0,
             // FIXME: HZ
             commit_interval: JBD_DEFAULT_MAX_COMMIT_AGE,
-        }
+        };
+        Ok(ret)
     }
 
     fn bmap(&self, block_id: u32) -> JBDResult<u32> {
@@ -382,7 +450,7 @@ impl Journal {
         states.tail = u32::from_be(sb.start);
         states.first = u32::from_be(sb.first);
         states.last = u32::from_be(sb.maxlen);
-        states.errno = u32::from_be(sb.errno);
+        states.errno = i32::from_be(sb.errno);
 
         Ok(())
     }
@@ -456,7 +524,52 @@ impl Journal {
         Ok(())
     }
 
-    fn recovery_one_pass(&mut self, pass_type: RecoveryPassType) -> JBDResult<RecoveryInfo> {
+    fn abort_soft(&mut self, errno: i32) {
+        let mut states = self.states.lock();
+        if states.flags.contains(JournalFlag::ABORT) {
+            return;
+        }
+
+        if states.errno != 0 {
+            states.errno = errno;
+        }
+        drop(states);
+
+        self.abort_hard();
+
+        if errno != 0 {
+            self.update_superblock();
+        }
+    }
+
+    fn abort_hard(&mut self) {
+        todo!()
+    }
+
+    fn recover_one_pass(&mut self, pass_type: RecoveryPassType) -> JBDResult<RecoveryInfo> {
+        let mut info = RecoveryInfo::zero_init();
+
+        // First thing is to establish what we expect to find in the log
+        // (in terms of transaction IDs), and where (in terms of log
+        // block offsets): query the superblock.
+        let mut sb_guard = self.sb_buffer.lock();
+        let sb = Self::superblock_mut(&mut sb_guard);
+
+        let next_commit_id = u32::from_be(sb.sequence);
+        let next_log_block = u32::from_be(sb.start);
+
+        let first_commit_id = next_commit_id;
+        if pass_type == RecoveryPassType::Scan {
+            info.start_transaction = first_commit_id as u16;
+        }
+
+        log::debug!("Starting recovery pass {:?}.", pass_type);
+
+        // Now we walk through the log, transaction by transaction,
+        // making sure that each transaction has a commit block in the
+        // expected place.  Each complete transaction gets replayed back
+        // into the main filesystem.
+
         todo!()
     }
 
