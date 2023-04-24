@@ -4,5 +4,7 @@ mod config;
 mod disk;
 mod err;
 mod journal;
-mod sal;
+pub mod sal;
 mod tx;
+
+pub use crate::journal::Journal;

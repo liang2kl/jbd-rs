@@ -16,15 +16,15 @@ pub trait BlockDevice: Send + Sync + Any {
     fn block_size(&self) -> usize;
 }
 
-pub trait Buffer: Send + Sync + Drop + Any {
+pub trait Buffer: Send + Sync + Any {
     fn device(&self) -> Arc<dyn BlockDevice>;
     fn block_id(&self) -> usize;
     fn size(&self) -> usize;
     fn dirty(&self) -> bool;
     fn data(&self) -> *mut u8;
-    fn private(&self) -> Option<Box<dyn Any>>;
+    fn private(&self) -> &Option<Box<dyn Any>>;
     fn set_private(&mut self, private: Option<Box<dyn Any>>);
-    fn set_jdb_managed(&mut self, managed: bool) -> u32;
+    fn set_jdb_managed(&mut self, managed: bool);
     fn jdb_managed(&self) -> bool;
     fn lock_managed(&mut self);
     fn unlock_managed(&mut self);
@@ -35,42 +35,43 @@ pub trait Buffer: Send + Sync + Drop + Any {
 }
 
 impl dyn Buffer {
-    pub fn buf(&self) -> &[u8] {
+    pub(crate) fn buf(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.data(), self.size()) }
     }
 
-    pub fn buf_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn buf_mut(&mut self) -> &mut [u8] {
         self.mark_dirty();
         unsafe { core::slice::from_raw_parts_mut(self.data(), self.size()) }
     }
 
-    pub fn convert<T>(&self) -> &T {
+    pub(crate) fn convert<T>(&self) -> &T {
         unsafe { &*(self.data() as *const T) }
     }
 
-    pub fn convert_mut<T>(&mut self) -> &mut T {
+    pub(crate) fn convert_mut<T>(&mut self) -> &mut T {
         self.mark_dirty();
         unsafe { &mut *(self.data() as *mut T) }
     }
 
-    pub fn journal_buffer(&self) -> Option<Arc<Mutex<JournalBuffer>>> {
-        self.private()?
+    pub(crate) fn journal_buffer(&self) -> Option<Arc<Mutex<JournalBuffer>>> {
+        self.private()
+            .as_deref()?
             .downcast_ref()
             .map(|x: &Arc<Mutex<JournalBuffer>>| x.clone())
     }
 
-    pub fn set_journal_buffer(&mut self, jb: Arc<Mutex<JournalBuffer>>) {
+    pub(crate) fn set_journal_buffer(&mut self, jb: Arc<Mutex<JournalBuffer>>) {
         self.set_jdb_managed(true);
         self.set_private(Some(Box::new(jb)));
     }
 }
 
 pub trait BufferProvider: Send + Sync + Any {
-    fn get_buffer(&self, dev: Arc<dyn BlockDevice>, block_id: usize) -> Option<Arc<Mutex<dyn Buffer>>>;
-    fn sync(&self) -> bool;
+    fn get_buffer(&mut self, dev: Arc<dyn BlockDevice>, block_id: usize) -> Option<Arc<Mutex<dyn Buffer>>>;
+    fn sync(&mut self) -> bool;
 }
 
 pub trait System: Send + Sync + Any {
-    fn get_buffer_provider(&self) -> Arc<dyn BufferProvider>;
+    fn get_buffer_provider(&self) -> Arc<Mutex<dyn BufferProvider>>;
     fn get_time(&self) -> usize;
 }

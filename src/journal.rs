@@ -108,6 +108,7 @@ impl Journal {
         };
         let sb_buffer = system
             .get_buffer_provider()
+            .lock()
             .get_buffer(devs.dev.clone(), devs.blk_offset as usize);
         if sb_buffer.is_none() {
             return Err(JBDError::IOError);
@@ -281,7 +282,9 @@ impl Journal {
         sb.start = states.tail.to_be();
         sb.errno = states.errno;
 
-        if sb.start != 0 {
+        sb_guard.sync();
+
+        if states.tail != 0 {
             states.flags.insert(JournalFlag::FLUSHED);
         } else {
             states.flags.remove(JournalFlag::FLUSHED);
@@ -337,12 +340,13 @@ impl Journal {
     fn get_buffer(&mut self, block_id: u32) -> JBDResult<Arc<Mutex<dyn Buffer>>> {
         self.system
             .get_buffer_provider()
+            .lock()
             .get_buffer(self.devs.dev.clone(), block_id as usize)
             .map_or(Err(JBDError::IOError), |bh| Ok(bh))
     }
 
     fn sync_buf(&mut self) -> JBDResult {
-        if self.system.get_buffer_provider().sync() {
+        if self.system.get_buffer_provider().lock().sync() {
             Ok(())
         } else {
             Err(JBDError::IOError)
