@@ -5,7 +5,7 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use bitflags::bitflags;
-use spin::{Mutex, MutexGuard};
+use spin::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 
 use crate::{
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
@@ -32,6 +32,10 @@ pub struct Journal {
     pub max_transaction_buffers: u32,
     // commit_interval: usize,
     // wbuf: Vec<Option<Arc<BufferHead>>>,
+    /// This lock owns nothing. Instead, it is used to serialize access
+    /// to the stuff protected by j_list_lock in Linux. Note that access to
+    /// transaction's lists requires transaction's lock (in Rust), too.
+    pub list_lock: Mutex<()>,
 }
 
 bitflags! {
@@ -137,6 +141,7 @@ impl Journal {
             devs,
             maxlen: len,
             max_transaction_buffers: 0,
+            list_lock: Mutex::new(()),
         };
 
         Ok(ret)
@@ -198,12 +203,12 @@ impl Journal {
     }
 }
 
-pub fn start(journal: Arc<Mutex<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
+pub fn start(journal: Arc<RwLock<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
     // TODO: Singleton handle for each process
     // FIXME: Is there a chance that we are already runing a transaction?
     let mut handle = Handle::new(nblocks);
-    let mut journal_guard = journal.lock();
-    start_handle(journal.clone(), &mut journal_guard, &mut handle)?;
+    let journal_guard = journal.write();
+    start_handle(journal.clone(), &journal_guard, &mut handle)?;
     todo!()
 }
 
@@ -355,8 +360,8 @@ impl Journal {
 }
 
 fn start_handle(
-    journal_ref: Arc<Mutex<Journal>>,
-    journal_guard: &mut MutexGuard<Journal>,
+    journal_ref: Arc<RwLock<Journal>>,
+    journal_guard: &RwLockWriteGuard<Journal>,
     handle: &mut Handle,
 ) -> JBDResult {
     let nblocks = handle.buffer_credits;
