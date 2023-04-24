@@ -135,7 +135,7 @@ impl BufferProvider for BlockCacheManager {
                 {
                     self.queue.drain(idx..=idx);
                 } else {
-                    panic!("Run out of BlockCache!");
+                    return None;
                 }
             }
             // load block into mem and push back
