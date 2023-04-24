@@ -8,13 +8,31 @@ use bitflags::bitflags;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
-    buffer::Buffer,
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
     disk::{BlockType, Superblock},
     err::{JBDError, JBDResult},
-    sal::{BlockDevice, System},
+    sal::{BlockDevice, Buffer, System},
     tx::{Handle, Tid, Transaction, TransactionState},
 };
+
+pub struct Journal {
+    pub system: Arc<dyn System>,
+    pub sb_buffer: Arc<Mutex<dyn Buffer>>,
+    pub format_version: i32,
+    /// Journal states protected by a single spin lock
+    pub states: Mutex<JournalStates>,
+    /// List of all transactions waiting for checkpointing
+    pub checkpoint_transactions: Mutex<LinkedList<Arc<Mutex<Transaction>>>>,
+    /// Block devices
+    pub devs: JournalDevs,
+    /// Total maximum capacity of the journal region on disk
+    pub maxlen: u32,
+    /// Maximum number of metadata buffers to allow in a single compound
+    /// commit transaction
+    pub max_transaction_buffers: u32,
+    // commit_interval: usize,
+    // wbuf: Vec<Option<Arc<BufferHead>>>,
+}
 
 bitflags! {
     pub struct JournalFlag: usize {
@@ -28,66 +46,47 @@ bitflags! {
     }
 }
 
-pub struct Journal {
-    system: Arc<dyn System>,
-    sb_buffer: Arc<Mutex<Buffer>>,
-    format_version: i32,
-    /// Journal states protected by a single spin lock
-    states: Mutex<JournalStates>,
-    /// List of all transactions waiting for checkpointing
-    checkpoint_transactions: Mutex<LinkedList<Arc<Mutex<Transaction>>>>,
-    /// Block devices
-    devs: JournalDevs,
-    /// Total maximum capacity of the journal region on disk
-    maxlen: u32,
-    /// Maximum number of metadata buffers to allow in a single compound
-    /// commit transaction
-    max_transaction_buffers: u32,
-    // commit_interval: usize,
-    // wbuf: Vec<Option<Arc<BufferHead>>>,
-}
-
-struct JournalDevs {
+pub struct JournalDevs {
     dev: Arc<dyn BlockDevice>,
     blk_offset: u32,
     fs_dev: Arc<dyn BlockDevice>,
 }
 
 /// Journal states protected by a single spin lock in Linux.
-struct JournalStates {
-    flags: JournalFlag,
-    errno: i32, // TODO: Strongly-typed error?
-    running_transaction: Option<Arc<Mutex<Transaction>>>,
-    committing_transaction: Option<Arc<Mutex<Transaction>>>,
+pub struct JournalStates {
+    pub flags: JournalFlag,
+    pub errno: i32, // TODO: Strongly-typed error?
+    pub running_transaction: Option<Arc<Mutex<Transaction>>>,
+    pub committing_transaction: Option<Arc<Mutex<Transaction>>>,
     /// Journal head: identifies the first unused block in the journal.
-    head: u32,
+    pub head: u32,
     /// Journal tail: identifies the oldest still-used block in the journal
-    tail: u32,
+    pub tail: u32,
     /// Journal free: how many free blocks are there in the journal?
-    free: u32,
+    pub free: u32,
     /// Journal start: the block number of the first usable block in the journal
-    first: u32,
+    pub first: u32,
     /// Journal end: the block number of the last usable block in the journal
-    last: u32,
+    pub last: u32,
 
     /// Sequence number of the oldest transaction in the log
-    tail_sequence: Tid,
+    pub tail_sequence: Tid,
     /// Sequence number of the next transaction to grant
-    transaction_sequence: Tid,
+    pub transaction_sequence: Tid,
     /// Sequence number of the most recently committed transaction
-    commit_sequence: Tid,
+    pub commit_sequence: Tid,
     /// Sequence number of the most recent transaction wanting commit
-    commit_request: Tid,
+    pub commit_request: Tid,
 }
 
 struct RevokeTable;
 
 pub struct JournalHead {
-    bh: Weak<Mutex<Buffer>>,
+    bh: Weak<Mutex<dyn Buffer>>,
 }
 
 impl JournalHead {
-    pub fn new(bh: Weak<Mutex<Buffer>>) -> Self {
+    pub fn new(bh: Weak<Mutex<dyn Buffer>>) -> Self {
         Self { bh }
     }
 }
@@ -199,6 +198,7 @@ impl Journal {
 }
 
 pub fn start(journal: Arc<Mutex<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
+    // TODO: Singleton handle for each process
     // FIXME: Is there a chance that we are already runing a transaction?
     let mut handle = Handle::new(nblocks);
     let mut journal_guard = journal.lock();
@@ -326,15 +326,15 @@ impl Journal {
         Ok(())
     }
 
-    fn superblock_ref<'a>(buf: &'a MutexGuard<Buffer>) -> &'a Superblock {
+    fn superblock_ref<'a>(buf: &'a MutexGuard<dyn Buffer>) -> &'a Superblock {
         buf.convert::<Superblock>()
     }
 
-    fn superblock_mut<'a>(buf: &'a mut MutexGuard<Buffer>) -> &'a mut Superblock {
+    fn superblock_mut<'a>(buf: &'a mut MutexGuard<dyn Buffer>) -> &'a mut Superblock {
         buf.convert_mut::<Superblock>()
     }
 
-    fn get_buffer(&mut self, block_id: u32) -> JBDResult<Arc<Mutex<Buffer>>> {
+    fn get_buffer(&mut self, block_id: u32) -> JBDResult<Arc<Mutex<dyn Buffer>>> {
         self.system
             .get_buffer_provider()
             .get_buffer(self.devs.dev.clone(), block_id as usize)

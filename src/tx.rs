@@ -2,8 +2,54 @@
 extern crate alloc;
 use spin::{Mutex, MutexGuard};
 
-use crate::{buffer::Buffer, err::JBDResult, journal::Journal};
+use crate::{
+    err::{JBDError, JBDResult},
+    journal::Journal,
+    sal::Buffer,
+};
 use alloc::{collections::LinkedList, sync::Arc, sync::Weak};
+
+/// Journal-internal buffer management unit, equivalent to journal_head in Linux.
+pub struct JournalBuffer {
+    buf: Arc<Mutex<dyn Buffer>>,
+    transaction: Option<Weak<Mutex<Transaction>>>,
+    /// Pointer to the running compound transaction which is currently
+    /// modifying the buffer's metadata, if there was already a transaction
+    /// committing it when the new transaction touched it.
+    next_transaction: Option<Weak<Mutex<Transaction>>>,
+    /// This flag signals the buffer has been modified by the currently running transaction
+    modified: bool,
+}
+
+impl JournalBuffer {
+    pub fn new_or_get(buf: Arc<Mutex<dyn Buffer>>) -> Arc<Mutex<Self>> {
+        let mut buf_locked = buf.lock();
+        match buf_locked.journal_buffer() {
+            Some(jb) => jb.clone(),
+            None => {
+                let ret = Arc::new(Mutex::new(Self {
+                    buf: buf.clone(),
+                    transaction: None,
+                    next_transaction: None,
+                    modified: false,
+                }));
+                buf_locked.set_journal_buffer(ret.clone());
+                ret
+            }
+        }
+    }
+}
+
+impl Drop for JournalBuffer {
+    fn drop(&mut self) {
+        // FIXME: journal_put_journal_head
+        let mut buf_locked = self.buf.lock();
+        if buf_locked.jdb_managed() {
+            buf_locked.set_jdb_managed(false);
+            buf_locked.set_private(None);
+        }
+    }
+}
 
 /// Transaction id.
 pub type Tid = u16;
@@ -33,35 +79,83 @@ pub struct Transaction {
     pub nr_buffers: i32,
     /// Doubly-linked circular list of all buffers reserved but not yet
     /// modified by this transaction [j_list_lock]
-    pub reserved_list: LinkedList<Arc<Mutex<Buffer>>>,
+    pub reserved_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
     /// Doubly-linked circular list of all buffers under writeout during
     /// commit [j_list_lock]
-    pub locked_list: LinkedList<Arc<Mutex<Buffer>>>,
+    pub locked_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
     /// Doubly-linked circular list of all metadata buffers owned by this
     /// transaction [j_list_lock]
-    pub buffers: LinkedList<Arc<Mutex<Buffer>>>,
+    pub buffers: LinkedList<Arc<Mutex<JournalBuffer>>>,
     /// Doubly-linked circular list of all data buffers still to be
     /// flushed before this transaction can be committed [j_list_lock]
-    pub sync_datalist: LinkedList<Arc<Mutex<Buffer>>>,
+    pub sync_datalist: LinkedList<Arc<Mutex<JournalBuffer>>>,
 
-    pub forget: LinkedList<Arc<Mutex<Buffer>>>,
-    pub checkpoint_list: LinkedList<Arc<Mutex<Buffer>>>,
-    pub checkpoint_io_list: LinkedList<Arc<Mutex<Buffer>>>,
-    pub iobuf_list: LinkedList<Arc<Mutex<Buffer>>>,
-    pub shadow_list: LinkedList<Arc<Mutex<Buffer>>>,
-    pub log_list: LinkedList<Arc<Mutex<Buffer>>>,
+    pub forget: LinkedList<Arc<Mutex<JournalBuffer>>>,
+    pub checkpoint_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
+    pub checkpoint_io_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
+    pub iobuf_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
+    pub shadow_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
+    pub log_list: LinkedList<Arc<Mutex<JournalBuffer>>>,
 
     pub handle_info: Mutex<TransactionHandleInfo>,
 
     pub expires: usize,
     pub start_time: usize, // TODO: ktime_t
     pub handle_count: i32,
-    pub synchronous_commit: bool,
+    // pub synchronous_commit: bool,
 }
 
 impl Transaction {
     pub fn new(journal: Weak<Mutex<Journal>>) -> Self {
-        todo!()
+        Self {
+            journal,
+            tid: 0,
+            state: TransactionState::Running,
+            log_start: 0,
+            nr_buffers: 0,
+            reserved_list: LinkedList::new(),
+            locked_list: LinkedList::new(),
+            buffers: LinkedList::new(),
+            sync_datalist: LinkedList::new(),
+            forget: LinkedList::new(),
+            checkpoint_list: LinkedList::new(),
+            checkpoint_io_list: LinkedList::new(),
+            iobuf_list: LinkedList::new(),
+            shadow_list: LinkedList::new(),
+            log_list: LinkedList::new(),
+            handle_info: Mutex::new(TransactionHandleInfo {
+                updates: 0,
+                outstanding_credits: 0,
+                handle_count: 0,
+            }),
+            expires: 0,
+            start_time: 0,
+            handle_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BufferListType {
+    None,
+    SyncData,
+    Metadata,
+    Forget,
+    IO,
+    Shwdow,
+    LogCtl,
+    Reserved,
+    Locked,
+}
+
+impl Transaction {
+    fn file_buffer(
+        &mut self,
+        jh: Arc<Mutex<JournalBuffer>>,
+        jh_guard: &MutexGuard<JournalBuffer>,
+        list_type: BufferListType,
+    ) {
+        todo!("file_buffer")
     }
 }
 
@@ -107,15 +201,65 @@ impl Handle {
 }
 
 impl Handle {
-    pub fn get_write_access(&self, buffer: Arc<Mutex<Buffer>>) -> JBDResult {
+    pub fn get_create_access(&self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
+        let jh_rc = JournalBuffer::new_or_get(buffer.clone());
+        let mut jh = jh_rc.lock();
+
+        if self.aborted {
+            return Err(JBDError::HandleAborted);
+        }
+
+        let mut buf = buffer.lock();
+        // TODO: j_list_lock
+        buf.lock_managed();
+        // TODO: Lots of assertions here
+
+        let tx_binding = self.transaction.clone().unwrap();
+        let mut tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.lock();
+
+        let should_set_next_tx = match &jh.transaction {
+            None => {
+                // From Linux:
+                // Previous journal_forget() could have left the buffer
+                // with jbddirty bit set because it was being committed. When
+                // the commit finished, we've filed the buffer for
+                // checkpointing and marked it dirty. Now we are reallocating
+                // the buffer so the transaction freeing it must have
+                // committed and so it's safe to clear the dirty bit.
+                buf.clear_dirty();
+                jh.modified = false;
+
+                tx.file_buffer(jh_rc.clone(), &jh, BufferListType::Reserved);
+                false
+            }
+            Some(tx) => {
+                let states = journal.states.lock();
+
+                match &states.committing_transaction {
+                    None => false,
+                    Some(committing_tx) => Arc::ptr_eq(&tx.upgrade().unwrap(), &committing_tx),
+                }
+            }
+        };
+
+        if should_set_next_tx {
+            jh.modified = false;
+            jh.next_transaction = Some(Arc::downgrade(&tx_binding));
+        }
+
+        buf.unlock_managed();
+        self.cancel_revoke(jh_rc.clone());
+
+        Ok(())
+    }
+
+    pub fn get_write_access(&self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
         todo!()
     }
 
-    pub fn restart(&self, nblocks: i32) -> JBDResult {
-        todo!()
-    }
-
-    pub fn extend(nblocks: i32) -> JBDResult {
+    pub fn cancel_revoke(&self, jh: Arc<Mutex<JournalBuffer>>) -> JBDResult {
         todo!()
     }
 

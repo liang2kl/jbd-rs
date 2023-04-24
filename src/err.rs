@@ -7,8 +7,11 @@ pub enum JBDError {
     InvalidJournalSize,
     InvalidSuperblock,
     NotEnoughSpace,
+    // Handle
+    HandleAborted,
     // Misc
     IOError,
+    Unknown,
 }
 
 pub type JBDResult<T = ()> = Result<T, JBDError>;
