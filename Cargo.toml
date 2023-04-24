@@ -1,0 +1,21 @@
+[package]
+name = "jbd-rs"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+log_level_off = ["log/max_level_off"]
+log_level_error = ["log/max_level_error"]
+log_level_warn = ["log/max_level_warn"]
+log_level_info = ["log/max_level_info"]
+log_level_debug = ["log/max_level_debug"]
+log_level_trace = ["log/max_level_trace"]
+default = []
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cfg-if = "1.0"
+bitflags = "1.2.1"
+spin = "0.7.0"
+log = "0.4"
