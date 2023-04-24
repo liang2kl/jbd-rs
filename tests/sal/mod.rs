@@ -5,7 +5,6 @@ use spin::Mutex;
 
 use self::{cache::BlockCacheManager, dev::FileDevice};
 
-pub mod buf;
 pub mod cache;
 pub mod dev;
 
