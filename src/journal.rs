@@ -1,16 +1,18 @@
 extern crate alloc;
 use core::mem::size_of;
 
-use alloc::{boxed::Box, collections::LinkedList, sync::Arc, vec::Vec};
+use alloc::{collections::LinkedList, sync::Arc, vec::Vec};
 use bitflags::bitflags;
 use spin::{Mutex, MutexGuard};
 
 use crate::{
-    buf::{BlockDevice, BufferHead, BufferProvider, DefaultBufferProvider},
-    config::{JBD_DEFAULT_MAX_COMMIT_AGE, JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS},
+    buffer::BufferHead,
+    config::{JBD_DEFAULT_MAX_COMMIT_AGE, JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
     disk::{BlockTag, BlockType, Superblock},
     err::{JBDError, JBDResult},
-    tx::{Tid, Transaction},
+    errno::EROFS,
+    sal::{BlockDevice, System, WaitQueue},
+    tx::{Handle, Tid, Transaction, TransactionState},
 };
 
 bitflags! {
@@ -26,7 +28,7 @@ bitflags! {
 }
 
 pub struct Journal {
-    buf_provider: Box<dyn BufferProvider>,
+    system: Arc<Mutex<dyn System>>,
     // TODO: j_inode, j_task, j_commit_timer, j_last_sync_writer, j_private
     sb_buffer: Arc<Mutex<BufferHead>>,
     // superblock: Superblock,
@@ -37,13 +39,26 @@ pub struct Journal {
     /// Journal lists protected by j_list_lock in Linux.
     lists: Mutex<JournalLists>,
 
-    // TODO: Wait queues
+    /// Wait queue for waiting for a locked transaction to start committing,
+    /// or for a barrier lock to be released
+    wait_transaction_locked: Arc<Mutex<dyn WaitQueue>>,
+    /// Wait queue for waiting for checkpointing to complete
+    wait_logspace: Arc<Mutex<dyn WaitQueue>>,
+    /// Wait queue for waiting for commit to complete
+    wait_done_commit: Arc<Mutex<dyn WaitQueue>>,
+    /// Wait queue to trigger checkpointing
+    wait_checkpoint: Arc<Mutex<dyn WaitQueue>>,
+    /// Wait queue to trigger commit
+    wait_commit: Arc<Mutex<dyn WaitQueue>>,
+    /// Wait queue to wait for updates to complete
+    wait_updates: Arc<Mutex<dyn WaitQueue>>,
+
     devs: JournalDevs,
 
     maxlen: u32,
 
     uuid: [u8; 16],
-    max_transaction_buffers: i32,
+    max_transaction_buffers: u32,
     commit_interval: usize,
 
     revoke_tables: Mutex<JournalRevokeTables>,
@@ -59,10 +74,11 @@ struct JournalDevs {
 
 /// Journal states protected by a single spin lock in Linux.
 struct JournalStates {
+    barrier_count: u32,
     flags: JournalFlag,
     errno: i32, // TODO: Strongly-typed error?
-    running_transaction: Option<Arc<Transaction>>,
-    committing_transaction: Option<Arc<Transaction>>,
+    running_transaction: Option<Arc<Mutex<Transaction>>>,
+    committing_transaction: Option<Arc<Mutex<Transaction>>>,
     head: u32,
     /// Journal tail: identifies the oldest still-used block in the journal
     tail: u32,
@@ -127,7 +143,7 @@ impl RecoveryInfo {
 /// Public interfaces.
 impl Journal {
     pub fn init_dev(
-        buf_provider: Box<dyn BufferProvider>,
+        system: Arc<Mutex<dyn System>>,
         dev: Arc<dyn BlockDevice>,
         fs_dev: Arc<dyn BlockDevice>,
         start: u32,
@@ -138,24 +154,13 @@ impl Journal {
             blk_offset: start,
             fs_dev,
         };
-        let mut journal = Self::init_common(buf_provider, devs)?;
+        let mut journal = Self::init_common(system, devs)?;
 
         let n_blks = journal.devs.dev.block_size() / size_of::<BlockTag>();
         journal.wbuf.resize(n_blks, None);
         journal.maxlen = len;
 
         Ok(journal)
-    }
-
-    pub fn init_dev_default(
-        dev: Arc<dyn BlockDevice>,
-        fs_dev: Arc<dyn BlockDevice>,
-        start: u32,
-        len: u32,
-        block_size: u32,
-    ) -> JBDResult<Self> {
-        let provider = Box::new(DefaultBufferProvider::new());
-        Self::init_dev(provider, dev, fs_dev, start, len)
     }
 
     pub fn create(&mut self) -> JBDResult {
@@ -168,7 +173,7 @@ impl Journal {
         log::debug!("Zeroing out journal blocks.");
         for i in 0..self.maxlen {
             let block_id = self.bmap(i)?;
-            let page_head_locked = self.buf_provider.get_buffer(self.devs.dev.clone(), block_id as usize)?;
+            let page_head_locked = self.get_buffer(block_id)?;
             let mut page_head = page_head_locked.lock();
             let buf = page_head.buf_mut();
             buf.fill(0);
@@ -176,7 +181,7 @@ impl Journal {
             // No need to __brelse, as rust has done the ref count for us :)
         }
 
-        self.buf_provider.sync()?;
+        self.sync_buf()?;
         log::debug!("Journal cleared.");
 
         let mut sb_guard = self.sb_buffer.lock();
@@ -323,7 +328,6 @@ impl Journal {
     pub fn errno(&self) -> i32 {
         let states = self.states.lock();
         if states.flags.contains(JournalFlag::ABORT) {
-            const EROFS: i32 = -30;
             -EROFS
         } else {
             states.errno
@@ -333,7 +337,6 @@ impl Journal {
     pub fn clear_err(&mut self) -> i32 {
         let mut states = self.states.lock();
         if states.flags.contains(JournalFlag::ABORT) {
-            const EROFS: i32 = -30;
             -EROFS
         } else {
             states.errno = 0;
@@ -351,16 +354,48 @@ impl Journal {
     // TODO: journal_blocks_per_page, ...
 }
 
+pub fn start(journal: Arc<Mutex<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
+    let mut journal_guard = journal.lock();
+    let mut system = journal_guard.system.lock();
+    if let Some(handle) = system.get_task_handle() {
+        return Ok(handle.clone());
+    }
+    let handle = Arc::new(Mutex::new(Handle::new(nblocks)));
+    system.set_task_handle(Some(handle.clone()));
+    drop(system);
+
+    let mut handle_guard = handle.lock();
+
+    let res = start_handle(journal.clone(), &mut journal_guard, &mut handle_guard);
+    let mut system = journal_guard.system.lock();
+
+    match res {
+        Ok(_) => Ok(handle.clone()),
+        Err(e) => {
+            system.set_task_handle(None);
+            Err(e)
+        }
+    }
+}
+
 /// Internal helper functions.
 impl Journal {
-    fn init_common(provider: Box<dyn BufferProvider>, devs: JournalDevs) -> JBDResult<Self> {
-        let mut provider = provider;
-        let sb_buffer = provider.get_buffer(devs.dev.clone(), devs.blk_offset as usize)?;
+    fn init_common(system: Arc<Mutex<dyn System>>, devs: JournalDevs) -> JBDResult<Self> {
+        let sb_buffer = system
+            .lock()
+            .get_buffer_provider()
+            .lock()
+            .get_buffer(devs.dev.clone(), devs.blk_offset as usize);
+        if sb_buffer.is_none() {
+            return Err(JBDError::IOError);
+        }
+        let system_guard = system.lock();
         let ret = Self {
-            buf_provider: provider,
-            sb_buffer,
+            system: system.clone(),
+            sb_buffer: sb_buffer.unwrap(),
             format_version: 0,
             states: Mutex::new(JournalStates {
+                barrier_count: 0,
                 flags: JournalFlag::ABORT,
                 errno: 0,
                 running_transaction: None,
@@ -385,6 +420,12 @@ impl Journal {
                 revoke_table: [RevokeTable, RevokeTable],
             }),
             wbuf: Vec::new(),
+            wait_transaction_locked: system_guard.new_wait_queue(),
+            wait_logspace: system_guard.new_wait_queue(),
+            wait_done_commit: system_guard.new_wait_queue(),
+            wait_checkpoint: system_guard.new_wait_queue(),
+            wait_commit: system_guard.new_wait_queue(),
+            wait_updates: system_guard.new_wait_queue(),
             devs,
             maxlen: 0,
             uuid: [0; 16],
@@ -431,7 +472,7 @@ impl Journal {
         states.commit_request = states.commit_sequence;
         drop(states);
 
-        self.max_transaction_buffers = self.maxlen as i32 / 4;
+        self.max_transaction_buffers = self.maxlen / 4;
 
         self.update_superblock();
 
@@ -474,7 +515,6 @@ impl Journal {
         sb.sequence = (states.tail_sequence as u32).to_be();
         sb.start = states.tail.to_be();
         sb.errno = states.errno;
-        // drop(states);
 
         // No need to mark dirty here, as superblock_mut has already set that.
         // TODO: Non-blocking I/O; trace_jbd_update_superblock_end (what is this?)
@@ -579,5 +619,125 @@ impl Journal {
 
     fn superblock_mut<'a>(buf: &'a mut MutexGuard<BufferHead>) -> &'a mut Superblock {
         buf.convert_mut::<Superblock>()
+    }
+
+    fn get_buffer(&mut self, block_id: u32) -> JBDResult<Arc<Mutex<BufferHead>>> {
+        self.system
+            .lock()
+            .get_buffer_provider()
+            .lock()
+            .get_buffer(self.devs.dev.clone(), block_id as usize)
+            .map_or(Err(JBDError::IOError), |bh| Ok(bh))
+    }
+
+    fn sync_buf(&mut self) -> JBDResult {
+        if self.system.lock().get_buffer_provider().lock().sync() {
+            Ok(())
+        } else {
+            Err(JBDError::IOError)
+        }
+    }
+}
+
+fn start_handle(
+    journal_ref: Arc<Mutex<Journal>>,
+    journal_guard: &mut MutexGuard<Journal>,
+    handle: &mut Handle,
+) -> JBDResult {
+    let nblocks = handle.buffer_credits;
+
+    if nblocks > journal_guard.max_transaction_buffers {
+        log::error!(
+            "Transaction requires too many credits ({} > {}).",
+            nblocks,
+            journal_guard.max_transaction_buffers
+        );
+        return Err(JBDError::NotEnoughSpace);
+    }
+
+    let system = journal_guard.system.lock();
+
+    log::debug!("New handle going live.");
+
+    'repeat: loop {
+        let mut states: MutexGuard<JournalStates> = journal_guard.states.lock();
+        if states.flags.contains(JournalFlag::ABORT)
+            || (states.errno != 0 && !states.flags.contains(JournalFlag::ACK_ERR))
+        {
+            log::error!("Journal has aborted.");
+            return Err(JBDError::IOError);
+        }
+
+        // Wait on the journal's transaction barrier if necessary
+        if states.barrier_count > 0 {
+            todo!("Wait for barrier.");
+            drop(states);
+            system.wait_event(journal_guard.wait_transaction_locked.clone(), &|| {
+                // FIXME: Can we lock the states again? RW lock?
+                journal_guard.states.lock().barrier_count == 0
+            });
+            continue 'repeat;
+        }
+
+        if states.running_transaction.is_none() {
+            let tx = Transaction::new(Arc::downgrade(&journal_ref.clone()));
+            let tx = Arc::new(Mutex::new(tx));
+            set_transaction(&mut states, &system, &tx);
+        }
+
+        let transaction_rc = states.running_transaction.as_ref().unwrap().clone();
+        let transaction = transaction_rc.lock();
+
+        if transaction.state == TransactionState::Locked {
+            todo!("Wait for transaction to unlock.");
+        }
+
+        let mut handle_info = transaction.handle_info.lock();
+        let needed = handle_info.outstanding_credits as u32 + nblocks;
+
+        if needed > journal_guard.max_transaction_buffers {
+            todo!("Wait for transaction to commit.");
+        }
+
+        if log_space_left(&states) < needed {
+            todo!("Wait for checkpoint.");
+        }
+
+        handle.transaction = Some(transaction_rc.clone());
+        handle_info.outstanding_credits += nblocks;
+        handle_info.updates += 1;
+        handle_info.handle_count += 1;
+
+        log::debug!("Handle now has {} credits.", handle_info.outstanding_credits);
+
+        return Ok(());
+    }
+}
+
+/// Start a new transaction in the journal, equivalent to get_transaction()
+/// in linux.
+fn set_transaction(
+    states: &mut MutexGuard<JournalStates>,
+    system: &MutexGuard<dyn System>,
+    tx_rc: &Arc<Mutex<Transaction>>,
+) {
+    let mut tx = tx_rc.lock();
+    tx.state = TransactionState::Running;
+    tx.start_time = system.get_time();
+    tx.tid = states.transaction_sequence;
+    states.transaction_sequence += 1;
+    // Here we replace jiffies with get_time.
+    // TODO: Timer
+    // tx.expires = tx.start_time + journal.commit_interval;
+    states.running_transaction = Some(tx_rc.clone());
+}
+
+fn log_space_left(states: &MutexGuard<JournalStates>) -> u32 {
+    let mut left = states.free;
+    left -= MIN_LOG_RESERVED_BLOCKS;
+    if left <= 0 {
+        0
+    } else {
+        left - (left >> 3)
     }
 }

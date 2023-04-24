@@ -1,9 +1,13 @@
 #[derive(Debug)]
 pub enum JBDError {
-    InvalidJournalSize,
+    // Buffer
     InsufficientCache,
     CacheNotFound,
+    // Journal
+    InvalidJournalSize,
     InvalidSuperblock,
+    NotEnoughSpace,
+    // Misc
     IOError,
 }
 

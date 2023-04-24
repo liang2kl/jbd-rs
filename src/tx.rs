@@ -1,90 +1,109 @@
 //! Transaction.
 extern crate alloc;
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 
-use alloc::{sync::Arc, collections::LinkedList};
-use crate::{journal::Journal, err::JBDResult, buf::BufferHead};
+use crate::{buffer::BufferHead, err::JBDResult, journal::Journal};
+use alloc::{collections::LinkedList, sync::Arc, sync::Weak};
 
 /// Transaction id.
 pub type Tid = u16;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TransactionState {
     Running,
-    Committing,
-    Committed,
-    Aborting,
-    Aborted,
+    Locked,
+    Flush,
+    Commit,
+    CommitRecord,
+    Finished,
 }
-
-type BufferHeadList = LinkedList<Arc<BufferHead>>;
 
 pub struct Transaction {
     /// Journal for this transaction [no locking]
-    journal: Arc<Journal>,
+    pub journal: Weak<Mutex<Journal>>,
     /// Sequence number for this transaction [no locking]
-    tid: Tid,
+    pub tid: Tid,
     /// Transaction's current state
     /// [no locking - only kjournald alters this]
-    state: TransactionState,
+    pub state: TransactionState,
     /// Where in the log does this transaction's commit start? [no locking]
-    log_start: u32,
+    pub log_start: u32,
     // TODO: j_list_lock
     /// Number of buffers on the t_buffers list [j_list_lock]
-    nr_buffers: i32,
+    pub nr_buffers: i32,
     /// Doubly-linked circular list of all buffers reserved but not yet
     /// modified by this transaction [j_list_lock]
-    reserved_list: BufferHeadList,
+    pub reserved_list: LinkedList<Arc<Mutex<BufferHead>>>,
     /// Doubly-linked circular list of all buffers under writeout during
-	/// commit [j_list_lock]
-    locked_list: BufferHeadList,
+    /// commit [j_list_lock]
+    pub locked_list: LinkedList<Arc<Mutex<BufferHead>>>,
     /// Doubly-linked circular list of all metadata buffers owned by this
-	/// transaction [j_list_lock]
-    buffers: BufferHeadList,
+    /// transaction [j_list_lock]
+    pub buffers: LinkedList<Arc<Mutex<BufferHead>>>,
     /// Doubly-linked circular list of all data buffers still to be
-	/// flushed before this transaction can be committed [j_list_lock]
-    sync_datalist: BufferHeadList,
+    /// flushed before this transaction can be committed [j_list_lock]
+    pub sync_datalist: LinkedList<Arc<Mutex<BufferHead>>>,
 
-    forget: BufferHeadList,
-    checkpoint_list: BufferHeadList,
-    checkpoint_io_list: BufferHeadList,
-    iobuf_list: BufferHeadList,
-    shadow_list: BufferHeadList,
-    log_list: BufferHeadList,
-    
-    handle_info: Mutex<TransactionHandleInfo>,
+    pub forget: LinkedList<Arc<Mutex<BufferHead>>>,
+    pub checkpoint_list: LinkedList<Arc<Mutex<BufferHead>>>,
+    pub checkpoint_io_list: LinkedList<Arc<Mutex<BufferHead>>>,
+    pub iobuf_list: LinkedList<Arc<Mutex<BufferHead>>>,
+    pub shadow_list: LinkedList<Arc<Mutex<BufferHead>>>,
+    pub log_list: LinkedList<Arc<Mutex<BufferHead>>>,
 
-    expires: usize,
-    start_time: usize, // TODO: ktime_t
-    handle_count: i32,
-    synchronous_commit: bool,
+    pub handle_info: Mutex<TransactionHandleInfo>,
+
+    pub expires: usize,
+    pub start_time: usize, // TODO: ktime_t
+    pub handle_count: i32,
+    pub synchronous_commit: bool,
+}
+
+impl Transaction {
+    pub fn new(journal: Weak<Mutex<Journal>>) -> Self {
+        todo!()
+    }
 }
 
 /// Info related to handles, protected by handle_lock in Linux.
 pub struct TransactionHandleInfo {
-    updates: i32,
-    outstanding_credits: i32,
+    pub updates: u32,
+    pub outstanding_credits: u32,
+    pub handle_count: u32,
 }
 
-
 /// Represents a single atomic update being performed by some process.
-struct Handle {
+pub struct Handle {
     /// Which compound transaction is this update a part of?
-    transaction: Arc<Transaction>,
+    pub transaction: Option<Arc<Mutex<Transaction>>>,
     /// Number of remaining buffers we are allowed to dirty
-    buffer_credits: i32,
-    err: i32, // TODO
+    pub buffer_credits: u32,
+    pub err: i32, // TODO
 
     /* Flags [no locking] */
     /// Sync-on-close
-    sync: bool,
+    pub sync: bool,
     /// Force data journaling
-    jdata: bool,
+    pub jdata: bool,
     /// Fatal error on handle
-    aborted: bool,
+    pub aborted: bool,
 }
 
 impl Handle {
-    pub fn start(journal: Arc<Journal>, nblocks: i32) -> Arc<Handle> {
+    pub fn new(nblocks: u32) -> Self {
+        Self {
+            transaction: None,
+            buffer_credits: nblocks,
+            err: 0,
+            sync: false,
+            jdata: false,
+            aborted: false,
+        }
+    }
+}
+
+impl Handle {
+    pub fn get_write_access(&self, buffer: Arc<Mutex<BufferHead>>) -> JBDResult {
         todo!()
     }
 
@@ -97,5 +116,4 @@ impl Handle {
     }
 
     // TODO: get_write_access, ...
-
 }

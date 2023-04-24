@@ -11,3 +11,5 @@ pub const JFS_MAGIC_NUMBER: u32 = 0xc03b3998;
 pub const JBD_EXPENSIVE_CHECKING: bool = true;
 #[cfg(not(feature = "debug"))]
 pub const JBD_EXPENSIVE_CHECKING: bool = false;
+
+pub const MIN_LOG_RESERVED_BLOCKS: u32 = 32;
