@@ -67,8 +67,8 @@ impl Drop for JournalBuffer {
     fn drop(&mut self) {
         // FIXME: journal_put_journal_head
         let mut buf_locked = self.buf.lock();
-        if buf_locked.jdb_managed() {
-            buf_locked.set_jdb_managed(false);
+        if buf_locked.jbd_managed() {
+            buf_locked.set_jbd_managed(false);
             buf_locked.set_private(None);
         }
     }
@@ -310,7 +310,7 @@ impl Handle {
         let journal_binding = tx.journal.upgrade().unwrap();
         let journal: spin::RwLockReadGuard<Journal> = journal_binding.read();
 
-        buf.lock_managed();
+        buf.lock_jbd();
         let list_lock = journal.list_lock.lock();
 
         let should_set_next_tx = match &jb.transaction {
@@ -344,7 +344,7 @@ impl Handle {
         }
 
         drop(list_lock);
-        buf.unlock_managed();
+        buf.unlock_jbd();
 
         self.cancel_revoke(jb_rc.clone())?;
 

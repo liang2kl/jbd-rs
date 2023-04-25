@@ -24,10 +24,10 @@ pub trait Buffer: Send + Sync + Any {
     fn data(&self) -> *mut u8;
     fn private(&self) -> &Option<Box<dyn Any>>;
     fn set_private(&mut self, private: Option<Box<dyn Any>>);
-    fn set_jdb_managed(&mut self, managed: bool);
-    fn jdb_managed(&self) -> bool;
-    fn lock_managed(&mut self);
-    fn unlock_managed(&mut self);
+    fn set_jbd_managed(&mut self, managed: bool);
+    fn jbd_managed(&self) -> bool;
+    fn lock_jbd(&mut self);
+    fn unlock_jbd(&mut self);
 
     fn mark_dirty(&mut self);
     fn clear_dirty(&mut self);
@@ -61,7 +61,7 @@ impl dyn Buffer {
     }
 
     pub(crate) fn set_journal_buffer(&mut self, jb: Arc<Mutex<JournalBuffer>>) {
-        self.set_jdb_managed(true);
+        self.set_jbd_managed(true);
         self.set_private(Some(Box::new(jb)));
     }
 }

@@ -19,7 +19,7 @@ struct BlockCache {
     dirty: bool,
     data: *mut u8,
     private: Option<Box<dyn Any>>,
-    jdb_managed: bool,
+    jbd_managed: bool,
 }
 
 unsafe impl Sync for BlockCache {}
@@ -36,7 +36,7 @@ impl BlockCache {
             dirty: false,
             data,
             private: None,
-            jdb_managed: false,
+            jbd_managed: false,
         }
     }
 }
@@ -70,17 +70,17 @@ impl Buffer for BlockCache {
         self.private = private;
     }
 
-    fn set_jdb_managed(&mut self, managed: bool) {
-        self.jdb_managed = managed;
+    fn set_jbd_managed(&mut self, managed: bool) {
+        self.jbd_managed = managed;
     }
 
-    fn jdb_managed(&self) -> bool {
-        self.jdb_managed
+    fn jbd_managed(&self) -> bool {
+        self.jbd_managed
     }
 
-    fn lock_managed(&mut self) {}
+    fn lock_jbd(&mut self) {}
 
-    fn unlock_managed(&mut self) {}
+    fn unlock_jbd(&mut self) {}
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
