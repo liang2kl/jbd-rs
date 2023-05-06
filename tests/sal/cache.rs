@@ -1,7 +1,7 @@
 use jbd_rs::sal::{BlockDevice, Buffer, BufferProvider};
 use spin::Mutex;
 use std::{
-    alloc::{alloc, Layout},
+    alloc::{self, Layout},
     any::Any,
     collections::VecDeque,
     slice,
@@ -26,7 +26,7 @@ unsafe impl Send for BlockCache {}
 
 impl BlockCache {
     pub fn new(block_id: usize, size: usize, device: Arc<dyn BlockDevice>) -> Self {
-        let data = unsafe { alloc(Layout::from_size_align(size, 8).unwrap()) };
+        let data = unsafe { alloc::alloc(Layout::from_size_align(size, 8).unwrap()) };
         device.read_block(block_id, unsafe { slice::from_raw_parts_mut(data, size) });
         Self {
             device,
@@ -128,6 +128,9 @@ impl Buffer for BlockCache {
 
 impl Drop for BlockCache {
     fn drop(&mut self) {
+        unsafe {
+            alloc::dealloc(self.data, Layout::from_size_align(self.size, 8).unwrap());
+        }
         self.sync();
     }
 }
@@ -144,7 +147,6 @@ impl BlockCacheManager {
 
 impl BufferProvider for BlockCacheManager {
     fn get_buffer(&mut self, dev: Arc<dyn BlockDevice>, block_id: usize) -> Option<Arc<Mutex<dyn Buffer>>> {
-        println!("get buffer {}", block_id);
         if let Some(pair) = self.queue.iter().find(|pair| pair.0 == block_id) {
             Some(Arc::clone(&pair.1))
         } else {
