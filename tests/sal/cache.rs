@@ -8,8 +8,6 @@ use std::{
     sync::Arc,
 };
 
-use super::dev;
-
 const BLOCK_CACHE_SIZE: usize = 16;
 
 struct BlockCache {
@@ -20,6 +18,7 @@ struct BlockCache {
     data: *mut u8,
     private: Option<Box<dyn Any>>,
     jbd_managed: bool,
+    jbd_dirty: bool,
 }
 
 unsafe impl Sync for BlockCache {}
@@ -37,6 +36,7 @@ impl BlockCache {
             data,
             private: None,
             jbd_managed: false,
+            jbd_dirty: false,
         }
     }
 }
@@ -99,6 +99,30 @@ impl Buffer for BlockCache {
             }
         }
         self.clear_dirty();
+    }
+
+    fn mark_jbd_dirty(&mut self) {
+        self.jbd_dirty = true;
+    }
+
+    fn clear_jbd_dirty(&mut self) {
+        self.jbd_dirty = false;
+    }
+
+    fn jbd_dirty(&self) -> bool {
+        self.jbd_dirty
+    }
+
+    fn test_clear_dirty(&mut self) -> bool {
+        let ret = self.dirty;
+        self.clear_dirty();
+        ret
+    }
+
+    fn test_clear_jbd_dirty(&mut self) -> bool {
+        let ret = self.jbd_dirty;
+        self.clear_jbd_dirty();
+        ret
     }
 }
 

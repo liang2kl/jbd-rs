@@ -41,6 +41,8 @@ pub struct JournalBuffer {
     modified: bool,
     /// List that the buffer is in
     list: BufferListType,
+    /// Copy of the buffer data frozen for writing to the log.
+    frozen_data: Option<Vec<u8>>,
 }
 
 impl JournalBuffer {
@@ -55,6 +57,7 @@ impl JournalBuffer {
                     next_transaction: None,
                     modified: false,
                     list: BufferListType::None,
+                    frozen_data: None,
                 }));
                 buf_locked.set_journal_buffer(ret.clone());
                 ret
@@ -208,10 +211,11 @@ impl TransactionLists {
 }
 
 impl Transaction {
-    /// Add a buffer to a transaction's list of buffers. Please call it with list_lock held.
+    /// Add a buffer to a transaction's list of buffers. Please call it with list_lock held
+    /// and make sure the generic buffer is unlocked.
     fn file_buffer(
         tx_ref: &Arc<Mutex<Transaction>>,
-        tx: MutexGuard<Transaction>,
+        tx: &MutexGuard<Transaction>,
         jb_ref: &Arc<Mutex<JournalBuffer>>,
         jb: &mut MutexGuard<JournalBuffer>,
         list_type: BufferListType,
@@ -220,7 +224,23 @@ impl Transaction {
             // The buffer is already in the right list
             return Ok(());
         }
-        // TODO: was_dirty
+
+        let was_dirty = match list_type {
+            BufferListType::Metadata | BufferListType::Reserved | BufferListType::Shadow | BufferListType::Forget => {
+                // From Linux:
+                // For metadata buffers, we track dirty bit in buffer_jbddirty
+                // instead of buffer_dirty. We should not see a dirty bit set
+                // here because we clear it in do_get_write_access but e.g.
+                // tune2fs can modify the sb and set the dirty bit at any time
+                // so we try to gracefully handle that.
+                let mut buf = jb.buf.lock();
+                if buf.dirty() {
+                    warn_dirty_buffer();
+                }
+                buf.test_clear_dirty() || buf.test_clear_jbd_dirty()
+            }
+            _ => false,
+        };
 
         // The lock is acquired here.
         let mut lists = tx.lists.lock();
@@ -231,7 +251,7 @@ impl Transaction {
             if list_type == BufferListType::Metadata {
                 lists.nr_buffers -= 1;
             }
-            // TODO: test_clear_buffer_jbddirty
+            // FIXME: Should we mark dirty here?
         } else {
             // Linux increments the ref count here, but we don't need to.
         }
@@ -246,7 +266,10 @@ impl Transaction {
         }
 
         jb.list = list_type;
-        // TODO: was_dirty
+
+        if was_dirty {
+            jb.buf.lock().mark_jbd_dirty();
+        }
 
         Ok(())
     }
@@ -294,6 +317,8 @@ impl Handle {
 }
 
 impl Handle {
+    /// Notify intent to use newly created buffer. Call this if you create a new buffer.
+    /// The buffer must not be locked.
     pub fn get_create_access(&self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buffer.clone());
         let mut jb = jb_rc.lock();
@@ -308,7 +333,7 @@ impl Handle {
         let tx_binding = self.transaction.clone().unwrap();
         let tx = tx_binding.lock();
         let journal_binding = tx.journal.upgrade().unwrap();
-        let journal: spin::RwLockReadGuard<Journal> = journal_binding.read();
+        let journal = journal_binding.read();
 
         buf.lock_jbd();
         let list_lock = journal.list_lock.lock();
@@ -325,7 +350,7 @@ impl Handle {
                 buf.clear_dirty();
                 jb.modified = false;
 
-                Transaction::file_buffer(&tx_binding, tx, &jb_rc, &mut jb, BufferListType::Reserved)?;
+                Transaction::file_buffer(&tx_binding, &tx, &jb_rc, &mut jb, BufferListType::Reserved)?;
                 false
             }
             Some(tx) => {
@@ -351,10 +376,12 @@ impl Handle {
         Ok(())
     }
 
+    /// Notify intent to modify a buffer for metadata (not data) update.
     pub fn get_write_access(&self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buffer.clone());
-
-        todo!()
+        // Make sure that the buffer completes any outstanding IO before proceeding
+        self.do_get_write_access(jb_rc.clone(), false)?;
+        Ok(())
     }
 
     pub fn cancel_revoke(&self, jh: Arc<Mutex<JournalBuffer>>) -> JBDResult {
@@ -362,4 +389,136 @@ impl Handle {
     }
 
     // TODO: get_write_access, ...
+}
+
+impl Handle {
+    /// If the buffer is already part of the current transaction, then there
+    /// is nothing we need to do.  If it is already part of a prior
+    /// transaction which we are still committing to disk, then we need to
+    /// make sure that we do not overwrite the old copy: we do copy-out to
+    /// preserve the copy going to disk.  We also account the buffer against
+    /// the handle's metadata buffer credits (unless the buffer is already
+    /// part of the transaction, that is).
+    fn do_get_write_access(&self, jb_rc: Arc<Mutex<JournalBuffer>>, force_copy: bool) -> JBDResult {
+        if self.aborted {
+            return Err(JBDError::HandleAborted);
+        }
+        let mut jb = jb_rc.lock();
+        // TODO
+
+        let buf_rc = jb.buf.clone();
+        let mut buf = buf_rc.lock();
+
+        buf.lock_jbd();
+
+        // From Linux:
+        // We now hold the buffer lock so it is safe to query the buffer
+        // state.  Is the buffer dirty?
+        //
+        // If so, there are two possibilities.  The buffer may be
+        // non-journaled, and undergoing a quite legitimate writeback.
+        // Otherwise, it is journaled, and we don't expect dirty buffers
+        // in that state (the buffers should be marked JBD_Dirty
+        // instead.)  So either the IO is being done under our own
+        // control and this is a bug, or it's a third party IO such as
+        // dump(8) (which may leave the buffer scheduled for read ---
+        // ie. locked but not dirty) or tune2fs (which may actually have
+        // the buffer dirtied, ugh.)
+        if buf.dirty() {
+            // First question: is this buffer already part of the current
+            // transaction or the existing committing transaction?
+            if jb.transaction.is_some() {
+                warn_dirty_buffer();
+            }
+            // In any case we need to clean the dirty flag.
+            buf.clear_dirty();
+            buf.mark_jbd_dirty();
+        }
+
+        if self.aborted {
+            buf.unlock_jbd();
+            return Err(JBDError::HandleAborted);
+        }
+
+        // A loop to conveniently convert from gotoes in Linux.
+        loop {
+            let this_tx = self.transaction.clone().ok_or(JBDError::Unknown)?;
+
+            // The buffer is already part of this transaction if b_transaction or
+            // b_next_transaction points to it
+            if let Some(tx) = &jb.transaction {
+                if tx.upgrade().map_or(false, |tx| Arc::ptr_eq(&tx, &this_tx)) {
+                    break;
+                }
+            }
+
+            jb.modified = false;
+
+            // If there is already a copy-out version of this buffer, then we don't
+            // need to make another one
+            if jb.frozen_data.is_some() {
+                jb.next_transaction = Some(Arc::downgrade(&this_tx));
+                break;
+            }
+
+            // Is there data here we need to preserve?
+            if let Some(tx) = &jb.transaction {
+                if !Arc::ptr_eq(&tx.upgrade().unwrap(), &this_tx) {
+                    // There is one case we have to be very careful about.
+                    // If the committing transaction is currently writing
+                    // this buffer out to disk and has NOT made a copy-out,
+                    // then we cannot modify the buffer contents at all
+                    // right now.  The essence of copy-out is that it is the
+                    // extra copy, not the primary copy, which gets
+                    // journaled.  If the primary copy is already going to
+                    // disk then we cannot do copy-out here.
+                    if jb.list == BufferListType::Shadow {
+                        todo!()
+                    }
+
+                    // Only do the copy if the currently-owning transaction
+                    // still needs it.  If it is on the Forget list, the
+                    // committing transaction is past that stage.  The
+                    // buffer had better remain locked during the kmalloc,
+                    // but that should be true --- we hold the journal lock
+                    // still and the buffer is already on the BUF_JOURNAL
+                    // list so won't be flushed.
+                    //
+                    // Subtle point, though: if this is a get_undo_access,
+                    // then we will be relying on the frozen_data to contain
+                    // the new value of the committed_data record after the
+                    // transaction, so we HAVE to force the frozen_data copy
+                    // in that case.
+                    if jb.list == BufferListType::Forget || force_copy {
+                        // Allocate memory for buffer and copy the data
+                        let mut frozen_data = Vec::new();
+                        frozen_data.clone_from_slice(buf.buf());
+                        jb.frozen_data = Some(frozen_data);
+                    }
+                    jb.next_transaction = Some(Arc::downgrade(&this_tx));
+                }
+            }
+            // Finally, if the buffer is not journaled right now, we need to make
+            // sure it doesn't get written to disk before the caller actually
+            // commits the new data
+            if jb.transaction.is_none() {
+                jb.transaction = Some(Arc::downgrade(&this_tx));
+                let tx = this_tx.lock();
+                let journal_binding = tx.journal.upgrade().unwrap();
+                let journal = journal_binding.read();
+                let _ = journal.list_lock.lock();
+                Transaction::file_buffer(&this_tx, &tx, &jb_rc, &mut jb, BufferListType::Reserved)?;
+            }
+        }
+        // done:
+        buf.unlock_jbd();
+        self.cancel_revoke(jb_rc.clone())?;
+
+        Ok(())
+    }
+}
+
+#[inline]
+fn warn_dirty_buffer() {
+    log::warn!("Buffer is dirty");
 }

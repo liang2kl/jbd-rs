@@ -24,14 +24,24 @@ pub trait Buffer: Send + Sync + Any {
     fn data(&self) -> *mut u8;
     fn private(&self) -> &Option<Box<dyn Any>>;
     fn set_private(&mut self, private: Option<Box<dyn Any>>);
-    fn set_jbd_managed(&mut self, managed: bool);
-    fn jbd_managed(&self) -> bool;
-    fn lock_jbd(&mut self);
-    fn unlock_jbd(&mut self);
 
+    // Normal writeback control. JBD might alter the related states
+    // to control writeback behaviours.
     fn mark_dirty(&mut self);
     fn clear_dirty(&mut self);
+    fn test_clear_dirty(&mut self) -> bool;
     fn sync(&mut self);
+
+    // JBD-specific state management. The related states should only
+    // be altered by JBD.
+    fn jbd_managed(&self) -> bool;
+    fn set_jbd_managed(&mut self, managed: bool);
+    fn lock_jbd(&mut self);
+    fn unlock_jbd(&mut self);
+    fn mark_jbd_dirty(&mut self);
+    fn clear_jbd_dirty(&mut self);
+    fn test_clear_jbd_dirty(&mut self) -> bool;
+    fn jbd_dirty(&self) -> bool;
 }
 
 impl dyn Buffer {
