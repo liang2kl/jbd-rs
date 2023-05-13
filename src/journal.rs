@@ -239,6 +239,24 @@ impl Journal {
     }
 }
 
+/// Commit related interfaces.
+impl Journal {
+    pub fn commit_transaction(&mut self) {
+        todo!()
+    }
+}
+
+/// Checkpoint related interfaces.
+impl Journal {
+    pub fn do_checkpoint(&mut self) -> JBDResult {
+        todo!()
+    }
+
+    pub fn cleanup_tail(&mut self) -> JBDResult {
+        todo!()
+    }
+}
+
 /// Internal helper functions.
 impl Journal {
     /// Given a journal_t structure, initialize the various fields for
