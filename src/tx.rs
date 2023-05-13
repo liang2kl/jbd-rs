@@ -4,7 +4,7 @@ use spin::{Mutex, MutexGuard, RwLock};
 
 use crate::{
     err::{JBDError, JBDResult},
-    journal::Journal,
+    journal::{log_space_left, start_handle, Journal},
     sal::Buffer,
 };
 use alloc::{sync::Arc, sync::Weak, vec::Vec};
@@ -37,12 +37,20 @@ pub struct JournalBuffer {
     /// modifying the buffer's metadata, if there was already a transaction
     /// committing it when the new transaction touched it.
     next_transaction: Option<Weak<Mutex<Transaction>>>,
+    /// Pointer to the compound transaction against which this buffer
+    /// is checkpointed.  Only dirty buffers can be checkpointed.
+    /// [j_list_lock]
+    cp_transaction: Option<Weak<Mutex<Transaction>>>,
     /// This flag signals the buffer has been modified by the currently running transaction
     modified: bool,
     /// List that the buffer is in
-    list: BufferListType,
+    jlist: BufferListType,
     /// Copy of the buffer data frozen for writing to the log.
     frozen_data: Option<Vec<u8>>,
+    /// Pointer to a saved copy of the buffer containing no uncommitted
+    /// deallocation references, so that allocations can avoid overwriting
+    /// uncommitted deletes.
+    commited_data: Option<Vec<u8>>,
 }
 
 impl JournalBuffer {
@@ -55,13 +63,22 @@ impl JournalBuffer {
                     buf: buf.clone(),
                     transaction: None,
                     next_transaction: None,
+                    cp_transaction: None,
                     modified: false,
-                    list: BufferListType::None,
+                    jlist: BufferListType::None,
                     frozen_data: None,
+                    commited_data: None,
                 }));
                 buf_locked.set_journal_buffer(ret.clone());
                 ret
             }
+        }
+    }
+
+    fn tx_eq(&self, tx: &Arc<Mutex<Transaction>>) -> bool {
+        match &self.transaction {
+            Some(t) => t.upgrade().map_or(false, |x| Arc::ptr_eq(&x, tx)),
+            None => false,
         }
     }
 }
@@ -220,14 +237,13 @@ impl Transaction {
         jb: &mut MutexGuard<JournalBuffer>,
         list_type: BufferListType,
     ) -> JBDResult {
-        if jb.transaction.is_some() && jb.list == list_type {
+        if jb.transaction.is_some() && jb.jlist == list_type {
             // The buffer is already in the right list
             return Ok(());
         }
 
         let was_dirty = match list_type {
             BufferListType::Metadata | BufferListType::Reserved | BufferListType::Shadow | BufferListType::Forget => {
-                // From Linux:
                 // For metadata buffers, we track dirty bit in buffer_jbddirty
                 // instead of buffer_dirty. We should not see a dirty bit set
                 // here because we clear it in do_get_write_access but e.g.
@@ -247,7 +263,7 @@ impl Transaction {
 
         if jb.transaction.is_some() {
             lists.remove(&jb_ref, list_type);
-            jb.list = list_type;
+            jb.jlist = list_type;
             if list_type == BufferListType::Metadata {
                 lists.nr_buffers -= 1;
             }
@@ -265,13 +281,36 @@ impl Transaction {
             return Ok(());
         }
 
-        jb.list = list_type;
+        jb.jlist = list_type;
 
         if was_dirty {
             jb.buf.lock().mark_jbd_dirty();
         }
 
         Ok(())
+    }
+
+    /// Remove a buffer from the appropriate transaction list.
+    /// Call under j_list_lock and unlocked tx.lists.
+    fn temp_unlink_buffer(
+        tx: &MutexGuard<Transaction>,
+        jb_ref: &Arc<Mutex<JournalBuffer>>,
+        jb: &mut MutexGuard<JournalBuffer>,
+        buf: &mut MutexGuard<dyn Buffer>,
+    ) {
+        // The lock is acquired here.
+        let mut lists = tx.lists.lock();
+
+        if jb.jlist == BufferListType::Metadata {
+            lists.nr_buffers -= 1;
+        }
+
+        lists.remove(&jb_ref, jb.jlist);
+        jb.jlist = BufferListType::None;
+
+        if buf.test_clear_jbd_dirty() {
+            buf.mark_dirty();
+        }
     }
 }
 
@@ -314,8 +353,96 @@ impl Handle {
             aborted: false,
         }
     }
+
+    pub fn extend(&mut self, nblocks: u32) -> JBDResult {
+        if self.aborted {
+            return Err(JBDError::HandleAborted);
+        }
+
+        let tx_binding = self.transaction.clone().unwrap();
+        let tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.write();
+
+        let states = journal.states.lock();
+
+        if tx.state != TransactionState::Running {
+            log::debug!("Denied handle extend {} blocks: transaction not running", nblocks);
+            return Err(JBDError::TransactionNotRunning);
+        }
+
+        let mut handle_info = tx.handle_info.lock();
+        let wanted = handle_info.outstanding_credits + nblocks;
+
+        if wanted > journal.max_transaction_buffers || wanted > log_space_left(&states) {
+            log::debug!("Denied handle extend {} blocks: not enough space", nblocks);
+            return Err(JBDError::NotEnoughSpace);
+        }
+
+        self.buffer_credits += nblocks;
+        handle_info.outstanding_credits += nblocks;
+
+        log::debug!("Extended handle by {} blocks", nblocks);
+
+        Ok(())
+    }
+
+    /// All done for a particular handle.
+    ///
+    /// There is not much action needed here.  We just return any remaining
+    /// buffer credits to the transaction and remove the handle.  The only
+    /// complication is that we need to start a commit operation if the
+    /// filesystem is marked for synchronous update.
+    ///
+    /// journal_stop itself will not usually return an error, but it may
+    /// do so in unusual circumstances.  In particular, expect it to
+    /// return -EIO if a journal_abort has been executed since the
+    /// transaction began.
+    pub fn stop(&self) -> JBDResult {
+        let tx_binding = self.transaction.clone().unwrap();
+        let tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.write();
+
+        // TODO: async version
+
+        journal.system.set_current_handle(None);
+
+        todo!();
+    }
+
+    /// Restart a handle for a multi-transaction filesystem
+    /// operation.
+    ///
+    /// If the Handle::extend() call above fails to grant new buffer credits
+    /// to a running handle, a call to journal_restart will commit the
+    /// handle's transaction so far and reattach the handle to a new
+    /// transaction capabable of guaranteeing the requested number of
+    /// credits.
+    pub fn restart(&mut self, nblocks: u32) -> JBDResult {
+        if self.aborted {
+            return Ok(());
+        }
+
+        let tx_binding = self.transaction.clone().unwrap();
+        let tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.write();
+
+        let mut handle_info = tx.handle_info.lock();
+        handle_info.outstanding_credits -= self.buffer_credits;
+        handle_info.updates -= 1;
+
+        // TODO: updates == 0
+        log::debug!("Restarted handle");
+        todo!("__log_start_commit");
+
+        self.buffer_credits = nblocks;
+        start_handle(journal_binding.clone(), &journal, &mut self);
+    }
 }
 
+// Buffer managements
 impl Handle {
     /// Notify intent to use newly created buffer. Call this if you create a new buffer.
     /// The buffer must not be locked.
@@ -384,11 +511,259 @@ impl Handle {
         Ok(())
     }
 
+    /// Sometimes there is a need to distinguish between metadata which has
+    /// been committed to disk and that which has not.  The ext3fs code uses
+    /// this for freeing and allocating space, we have to make sure that we
+    /// do not reuse freed space until the deallocation has been committed,
+    /// since if we overwrote that space we would make the delete
+    /// un-rewindable in case of a crash.
+    ///
+    /// To deal with that, journal_get_undo_access requests write access to a
+    /// buffer for parts of non-rewindable operations such as delete
+    /// operations on the bitmaps.  The journaling code must keep a copy of
+    /// the buffer's contents prior to the undo_access call until such time
+    /// as we know that the buffer has definitely been committed to disk.
+    ///
+    /// We never need to know which transaction the committed data is part
+    /// of, buffers touched here are guaranteed to be dirtied later and so
+    /// will be committed to a new transaction in due course, at which point
+    /// we can discard the old committed data pointer.
+    pub fn get_undo_access(&self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
+        let jb_rc = JournalBuffer::new_or_get(buffer.clone());
+        let buf = buffer.lock();
+
+        self.do_get_write_access(jb_rc.clone(), true)?;
+
+        let mut jb = jb_rc.lock();
+        if jb.commited_data.is_none() {
+            jb.commited_data = Some(Vec::new());
+        }
+
+        let commited_data = jb.commited_data.as_mut().unwrap();
+        commited_data.copy_from_slice(buf.buf());
+
+        Ok(())
+    }
+
+    /// Mark a buffer as containing dirty data which needs to be flushed before
+    /// we can commit the current transaction.
+    ///
+    /// The buffer is placed on the transaction's data list and is marked as
+    /// belonging to the transaction.
+    pub fn dirty_data(&mut self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
+        if self.aborted {
+            return Err(JBDError::HandleAborted);
+        }
+
+        let jb_rc = JournalBuffer::new_or_get(buffer.clone());
+        let mut jb = jb_rc.lock();
+        let tx_binding = self.transaction.as_mut().unwrap();
+        let tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.read();
+
+        // What if the buffer is already part of a running transaction?
+        //
+        // There are two cases:
+        // 1) It is part of the current running transaction.  Refile it,
+        //    just in case we have allocated it as metadata, deallocated
+        //    it, then reallocated it as data.
+        // 2) It is part of the previous, still-committing transaction.
+        //    If all we want to do is to guarantee that the buffer will be
+        //    written to disk before this new transaction commits, then
+        //    being sure that the *previous* transaction has this same
+        //    property is sufficient for us!  Just leave it on its old
+        //    transaction.
+        //
+        // In case (2), the buffer must not already exist as metadata
+        // --- that would violate write ordering (a transaction is free
+        // to write its data at any point, even before the previous
+        // committing transaction has committed).  The caller must
+        // never, ever allow this to happen: there's nothing we can do
+        // about it in this layer.
+        let mut buf = buffer.lock();
+        buf.lock_jbd();
+        let mut list_lock = journal.list_lock.lock();
+
+        // TODO: buffer_mapped
+
+        if let Some(jb_tx) = &jb.transaction {
+            let jb_tx = jb_tx.upgrade().unwrap();
+            if !Arc::ptr_eq(&jb_tx, &tx_binding) {
+                // The buffer belongs to a different transaction.
+                if jb.jlist != BufferListType::None
+                    && jb.jlist != BufferListType::SyncData
+                    && jb.jlist != BufferListType::Locked
+                {
+                    drop(list_lock);
+                    buf.unlock_jbd();
+
+                    return Ok(());
+                }
+
+                if buf.dirty() {
+                    // write back synchronously
+                    drop(list_lock);
+                    buf.unlock_jbd();
+                    buf.sync();
+                    buf.lock_jbd();
+                    list_lock = journal.list_lock.lock();
+                    // TODO: if !buffer_mapped
+                }
+                // TODO: if (unlikely(!buffer_uptodate(bh)))
+                if let Some(jb_tx) = &jb.transaction {
+                    let jb_tx = jb_tx.upgrade().unwrap();
+                    if !Arc::ptr_eq(&jb_tx, &tx_binding) {
+                        // Unlink buffer from old transaction
+                        Transaction::temp_unlink_buffer(&jb_tx.lock(), &jb_rc, &mut jb, &mut buf);
+                        jb.transaction = Some(Arc::downgrade(tx_binding));
+                    }
+                }
+            }
+
+            if jb.jlist != BufferListType::SyncData && jb.jlist != BufferListType::Locked {
+                // jb.jlist == BufferListType::None here
+                Transaction::file_buffer(&tx_binding, &tx, &jb_rc, &mut jb, BufferListType::SyncData)?;
+            }
+        } else {
+            Transaction::file_buffer(&tx_binding, &tx, &jb_rc, &mut jb, BufferListType::SyncData)?;
+        }
+
+        // no_journal:
+        drop(list_lock);
+        buf.unlock_jbd();
+
+        Ok(())
+    }
+
+    /// Mark dirty metadata which needs to be journaled as part of the current
+    /// transaction.
+    ///
+    /// The buffer is placed on the transaction's metadata list and is marked
+    /// as belonging to the transaction.
+    ///
+    /// Special care needs to be taken if the buffer already belongs to the
+    /// current committing transaction (in which case we should have frozen
+    /// data present for that commit).  In that case, we don't relink the
+    /// buffer: that only gets done when the old transaction finally
+    /// completes its commit.
+    pub fn dirty_metadata(&mut self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
+        if self.aborted {
+            return Err(JBDError::HandleAborted);
+        }
+
+        let jb_binding = JournalBuffer::new_or_get(buffer.clone());
+        let mut jb = jb_binding.lock();
+        let tx_binding = self.transaction.as_mut().unwrap();
+        let tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.write();
+
+        let mut buf = buffer.lock();
+        buf.lock_jbd();
+
+        if !jb.modified {
+            jb.modified = true;
+            self.buffer_credits -= 1;
+        }
+
+        if jb.tx_eq(&tx_binding) && jb.jlist == BufferListType::Metadata {
+            // The buffer is already part of the metadata of current transaction.
+            // Nothing to do.
+            buf.unlock_jbd();
+            return Ok(());
+        }
+
+        let list_lock = journal.list_lock.lock();
+        Transaction::file_buffer(&tx_binding, &tx, &jb_binding, &mut jb, BufferListType::Metadata)?;
+        drop(list_lock);
+        buf.unlock_jbd();
+
+        Ok(())
+    }
+
+    /// bforget() for potentially-journaled buffers.
+    ///
+    /// We can only do the bforget if there are no commits pending against the
+    /// buffer.  If the buffer is dirty in the current running transaction we
+    /// can safely unlink it.
+    ///
+    /// bh may not be a journalled buffer at all - it may be a non-JBD
+    /// buffer which came off the hashtable.  Check for this.
+    ///
+    /// Allow this call even if the handle has aborted --- it may be part of
+    /// the caller's cleanup after an abort.
+    fn forget(&mut self, buffer: Arc<Mutex<dyn Buffer>>) -> JBDResult {
+        let jb_binding = JournalBuffer::new_or_get(buffer.clone());
+        let mut jb = jb_binding.lock();
+        let tx_binding = self.transaction.as_mut().unwrap();
+        let tx = tx_binding.lock();
+        let journal_binding = tx.journal.upgrade().unwrap();
+        let journal = journal_binding.write();
+
+        let mut buf = buffer.lock();
+        buf.lock_jbd();
+        let list_lock = journal.list_lock.lock();
+
+        buf.lock_jbd();
+        if !buf.jbd_managed() {
+            drop(list_lock);
+            buf.unlock_jbd();
+            return Ok(());
+        }
+
+        if jb.commited_data.is_some() {
+            // Critical error: attempting to delete a bitmap buffer, maybe?
+            drop(list_lock);
+            buf.unlock_jbd();
+            return Err(JBDError::IOError);
+        }
+
+        let was_modified = jb.modified;
+        jb.modified = false;
+
+        let mut drop_reserve = false;
+
+        if jb.tx_eq(&tx_binding) {
+            buf.clear_dirty();
+            buf.clear_jbd_dirty();
+
+            // We only want to drop a reference if this transaction
+            // modified the buffer
+            if was_modified {
+                drop_reserve = true;
+            }
+
+            if jb.cp_transaction.is_some() {
+                Transaction::temp_unlink_buffer(&tx, &jb_binding, &mut jb, &mut buf);
+                Transaction::file_buffer(&tx_binding, &tx, &jb_binding, &mut jb, BufferListType::Forget)?;
+            } else {
+                todo!("unfile_buffer")
+            }
+        } else if jb.transaction.is_some() {
+            // Belongs to older transaction
+            if jb.next_transaction.is_some() {
+                jb.next_transaction = None;
+                if was_modified {
+                    drop_reserve = true;
+                }
+            }
+        }
+
+        drop(list_lock);
+        buf.unlock_jbd();
+
+        if drop_reserve {
+            // No need to reserve log space for this block
+            self.buffer_credits -= 1;
+        }
+
+        Ok(())
+    }
+
     pub fn cancel_revoke(&self, jh: Arc<Mutex<JournalBuffer>>) -> JBDResult {
         todo!()
     }
-
-    // TODO: get_write_access, ...
 }
 
 impl Handle {
@@ -411,7 +786,6 @@ impl Handle {
 
         buf.lock_jbd();
 
-        // From Linux:
         // We now hold the buffer lock so it is safe to query the buffer
         // state.  Is the buffer dirty?
         //
@@ -472,7 +846,7 @@ impl Handle {
                     // extra copy, not the primary copy, which gets
                     // journaled.  If the primary copy is already going to
                     // disk then we cannot do copy-out here.
-                    if jb.list == BufferListType::Shadow {
+                    if jb.jlist == BufferListType::Shadow {
                         todo!()
                     }
 
@@ -489,7 +863,7 @@ impl Handle {
                     // the new value of the committed_data record after the
                     // transaction, so we HAVE to force the frozen_data copy
                     // in that case.
-                    if jb.list == BufferListType::Forget || force_copy {
+                    if jb.jlist == BufferListType::Forget || force_copy {
                         // Allocate memory for buffer and copy the data
                         let mut frozen_data = Vec::new();
                         frozen_data.clone_from_slice(buf.buf());

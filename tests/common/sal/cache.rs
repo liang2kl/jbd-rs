@@ -91,7 +91,6 @@ impl Buffer for BlockCache {
     }
 
     fn sync(&mut self) {
-        println!("sync block {}", self.block_id);
         if self.dirty {
             unsafe {
                 self.device

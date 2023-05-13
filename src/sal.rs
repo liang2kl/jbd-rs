@@ -1,11 +1,11 @@
 //! The system abstraction layer.
 // TODO: jbd_alloc, jbd_free
-use core::any::Any;
+use core::{any::Any, marker::PhantomData};
 extern crate alloc;
 use alloc::{boxed::Box, sync::Arc};
 use spin::Mutex;
 
-use crate::tx::JournalBuffer;
+use crate::tx::{Handle, JournalBuffer};
 
 pub trait BlockDevice: Send + Sync + Any {
     /// Read data form block to buffer
@@ -22,6 +22,8 @@ pub trait Buffer: Send + Sync + Any {
     fn size(&self) -> usize;
     fn dirty(&self) -> bool;
     fn data(&self) -> *mut u8;
+
+    // Related methods of the `private` field of `struct buffer_head`
     fn private(&self) -> &Option<Box<dyn Any>>;
     fn set_private(&mut self, private: Option<Box<dyn Any>>);
 
@@ -84,4 +86,6 @@ pub trait BufferProvider: Send + Sync + Any {
 pub trait System: Send + Sync + Any {
     fn get_buffer_provider(&self) -> Arc<Mutex<dyn BufferProvider>>;
     fn get_time(&self) -> usize;
+    fn get_current_handle(&self) -> Option<Arc<Mutex<Handle>>>;
+    fn set_current_handle(&self, handle: Option<Arc<Mutex<Handle>>>);
 }

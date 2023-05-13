@@ -1,6 +1,9 @@
 use std::{io, sync::Arc};
 
-use jbd_rs::sal::{BlockDevice, BufferProvider, System};
+use jbd_rs::{
+    sal::{BlockDevice, BufferProvider, System},
+    Handle,
+};
 use spin::Mutex;
 
 use self::{cache::BlockCacheManager, dev::FileDevice};
@@ -11,6 +14,7 @@ pub mod dev;
 pub struct UserSystem {
     device: Arc<dyn BlockDevice>,
     cache_manager: Arc<Mutex<BlockCacheManager>>,
+    current_handle: Mutex<Option<Arc<Mutex<Handle>>>>,
 }
 
 impl UserSystem {
@@ -20,6 +24,7 @@ impl UserSystem {
         Ok(Self {
             device: Arc::new(device),
             cache_manager,
+            current_handle: Mutex::new(None),
         })
     }
 
@@ -35,5 +40,12 @@ impl System for UserSystem {
     fn get_time(&self) -> usize {
         // TODO
         0
+    }
+    fn get_current_handle(&self) -> Option<Arc<Mutex<Handle>>> {
+        self.current_handle.lock().clone()
+    }
+    fn set_current_handle(&self, handle: Option<Arc<Mutex<Handle>>>) {
+        let mut this_handle = self.current_handle.lock();
+        *this_handle = handle;
     }
 }

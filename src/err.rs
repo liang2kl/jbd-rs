@@ -9,6 +9,7 @@ pub enum JBDError {
     NotEnoughSpace,
     // Handle
     HandleAborted,
+    TransactionNotRunning,
     // Misc
     IOError,
     Unknown,

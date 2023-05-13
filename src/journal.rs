@@ -201,15 +201,42 @@ impl Journal {
 
         Ok(())
     }
-}
 
-pub fn start(journal: Arc<RwLock<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
-    // TODO: Singleton handle for each process
-    // FIXME: Is there a chance that we are already runing a transaction?
-    let mut handle = Handle::new(nblocks);
-    let journal_guard = journal.write();
-    start_handle(journal.clone(), &journal_guard, &mut handle)?;
-    todo!()
+    // void journal_lock_updates () - establish a transaction barrier.
+    // @journal:  Journal to establish a barrier on.
+    //
+    // This locks out any further updates from being started, and blocks until all
+    // existing updates have completed, returning only once the journal is in a
+    // quiescent state with no updates running.
+    //
+    // We do not use simple mutex for synchronization as there are syscalls which
+    // want to return with filesystem locked and that trips up lockdep. Also
+    // hibernate needs to lock filesystem but locked mutex then blocks hibernation.
+    // Since locking filesystem is rare operation, we use simple counter and
+    // waitqueue for locking.
+    pub fn lock_updates(&mut self) {
+        todo!()
+    }
+
+    pub fn unlock_updates(&mut self) {
+        todo!()
+    }
+
+    pub fn force_commit(&mut self) {
+        todo!()
+    }
+
+    pub fn start(journal: Arc<RwLock<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
+        let journal_guard = journal.write();
+        if let Some(current_handle) = journal_guard.system.get_current_handle() {
+            return Ok(current_handle.clone());
+        }
+        let mut handle = Handle::new(nblocks);
+        start_handle(journal.clone(), &journal_guard, &mut handle)?;
+        let handle = Arc::new(Mutex::new(handle));
+        journal_guard.system.set_current_handle(Some(handle.clone()));
+        return Ok(handle);
+    }
 }
 
 /// Internal helper functions.
@@ -359,7 +386,7 @@ impl Journal {
     }
 }
 
-fn start_handle(
+pub(crate) fn start_handle(
     journal_ref: Arc<RwLock<Journal>>,
     journal_guard: &RwLockWriteGuard<Journal>,
     handle: &mut Handle,
@@ -432,7 +459,7 @@ fn set_transaction(states: &mut MutexGuard<JournalStates>, system: &Arc<dyn Syst
     states.running_transaction = Some(tx_rc.clone());
 }
 
-fn log_space_left(states: &MutexGuard<JournalStates>) -> u32 {
+pub(crate) fn log_space_left(states: &MutexGuard<JournalStates>) -> u32 {
     let mut left = states.free;
     left -= MIN_LOG_RESERVED_BLOCKS;
     if left <= 0 {
