@@ -7,10 +7,14 @@ use crate::{
     journal::{log_space_left, start_handle, Journal},
     sal::Buffer,
 };
-use alloc::{sync::Arc, sync::Weak, vec::Vec};
+use alloc::{
+    sync::Arc,
+    sync::Weak,
+    vec::{self, Vec},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BufferListType {
+pub(crate) enum BufferListType {
     None,
     SyncData,
     Metadata,
@@ -24,7 +28,7 @@ enum BufferListType {
 
 /// Journal-internal buffer management unit, equivalent to journal_head in Linux.
 pub struct JournalBuffer {
-    buf: Arc<Mutex<dyn Buffer>>,
+    pub(crate) buf: Arc<Mutex<dyn Buffer>>,
     /// Pointer to the compound transaction which owns this buffer's
     /// metadata: either the running transaction or the committing
     /// transaction (if there is one).  Only applies to buffers on a
@@ -32,25 +36,25 @@ pub struct JournalBuffer {
     /// [j_list_lock] [jbd_lock_bh_state()]
     /// Either of these locks is enough for reading, both are needed for
     /// changes.
-    transaction: Option<Weak<Mutex<Transaction>>>,
+    pub(crate) transaction: Option<Weak<Mutex<Transaction>>>,
     /// Pointer to the running compound transaction which is currently
     /// modifying the buffer's metadata, if there was already a transaction
     /// committing it when the new transaction touched it.
-    next_transaction: Option<Weak<Mutex<Transaction>>>,
+    pub(crate) next_transaction: Option<Weak<Mutex<Transaction>>>,
     /// Pointer to the compound transaction against which this buffer
     /// is checkpointed.  Only dirty buffers can be checkpointed.
     /// [j_list_lock]
-    cp_transaction: Option<Weak<Mutex<Transaction>>>,
+    pub(crate) cp_transaction: Option<Weak<Mutex<Transaction>>>,
     /// This flag signals the buffer has been modified by the currently running transaction
-    modified: bool,
+    pub(crate) modified: bool,
     /// List that the buffer is in
-    jlist: BufferListType,
+    pub(crate) jlist: BufferListType,
     /// Copy of the buffer data frozen for writing to the log.
-    frozen_data: Option<Vec<u8>>,
+    pub(crate) frozen_data: Option<Vec<u8>>,
     /// Pointer to a saved copy of the buffer containing no uncommitted
     /// deallocation references, so that allocations can avoid overwriting
     /// uncommitted deletes.
-    commited_data: Option<Vec<u8>>,
+    pub(crate) commited_data: Option<Vec<u8>>,
 }
 
 impl JournalBuffer {
@@ -126,7 +130,7 @@ pub struct Transaction {
     // pub synchronous_commit: bool,
 }
 
-pub struct JournalBufferList(Vec<Arc<Mutex<JournalBuffer>>>);
+pub struct JournalBufferList(pub Vec<Arc<Mutex<JournalBuffer>>>);
 
 impl JournalBufferList {
     fn new() -> Self {
@@ -311,6 +315,48 @@ impl Transaction {
         if buf.test_clear_jbd_dirty() {
             buf.mark_dirty();
         }
+    }
+
+    fn unfile_buffer(
+        jb_ref: &Arc<Mutex<JournalBuffer>>,
+        jb: &mut MutexGuard<JournalBuffer>,
+        buf: &mut MutexGuard<dyn Buffer>,
+    ) {
+        assert!(jb.transaction.is_some());
+        Self::temp_unlink_buffer(
+            &jb.transaction.as_ref().unwrap().upgrade().unwrap().lock(),
+            jb_ref,
+            jb,
+            buf,
+        );
+        jb.transaction = None;
+    }
+
+    /// Remove a buffer from its current buffer list in preparation for
+    /// dropping it from its current transaction entirely.  If the buffer has
+    /// already started to be used by a subsequent transaction, refile the
+    /// buffer on that transaction's metadata list.
+    ///
+    /// Please call it with list_lock held and tx.lists unlocked.
+    pub(crate) fn refile_buffer(jb_ref: &Arc<Mutex<JournalBuffer>>, jb: &mut MutexGuard<JournalBuffer>) {
+        let buf_binding = jb.buf.clone();
+        let buf = &mut buf_binding.lock();
+
+        // If the buffer is now unused, just drop it.
+        if jb.next_transaction.is_none() {
+            Transaction::unfile_buffer(jb_ref, jb, buf);
+            return;
+        }
+
+        // It has been modified by a later transaction: add it to the new
+        // transaction's metadata list.
+        todo!();
+        // let was_dirty = buf.test_clear_jbd_dirty();
+        // let tx_binding = jb.transaction.as_ref().unwrap().upgrade().unwrap();
+        // Transaction::temp_unlink_buffer(&tx_binding.lock(), jb_ref, jb, buf);
+
+        // jb.transaction = jb.next_transaction.clone();
+        // jb.next_transaction = None;
     }
 }
 

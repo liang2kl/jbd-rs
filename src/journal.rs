@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::{
     collections::LinkedList,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use bitflags::bitflags;
 use spin::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
@@ -11,6 +12,7 @@ use crate::{
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
     disk::{BlockType, Superblock},
     err::{JBDError, JBDResult},
+    jbd_assert,
     sal::{BlockDevice, Buffer, System},
     tx::{Handle, Tid, Transaction, TransactionState},
 };
@@ -242,7 +244,81 @@ impl Journal {
 /// Commit related interfaces.
 impl Journal {
     pub fn commit_transaction(&mut self) {
-        todo!()
+        // First job: lock down the current transaction and wait for
+        // all outstanding updates to complete.
+        let mut states = self.states.lock();
+        if states.flags.contains(JournalFlag::FLUSHED) {
+            drop(states);
+            self.update_superblock();
+            states = self.states.lock();
+        }
+        assert!(states.running_transaction.is_some());
+        assert!(states.committing_transaction.is_none());
+
+        let mut commit_tx = states.running_transaction.as_mut().unwrap().lock();
+        assert!(commit_tx.state == TransactionState::Running);
+
+        log::debug!("Start committing transaction {}.", commit_tx.tid);
+        commit_tx.state = TransactionState::Locked;
+
+        let handle_info = commit_tx.handle_info.lock();
+        while handle_info.updates > 0 {
+            todo!("wait for updates to complete");
+        }
+
+        assert!(handle_info.outstanding_credits <= self.max_transaction_buffers);
+        drop(handle_info);
+
+        let mut tx_lists = commit_tx.lists.lock();
+        let mut reserved_list: Vec<_> = tx_lists.reserved_list.0.clone();
+        tx_lists.reserved_list.0.clear();
+        drop(tx_lists);
+
+        for jb_binding in reserved_list.into_iter() {
+            let mut jb = jb_binding.lock();
+            if jb.commited_data.is_some() {
+                let _ = jb.buf.lock();
+                jb.commited_data = None;
+            }
+            Transaction::refile_buffer(&jb_binding, &mut jb);
+        }
+
+        // TODO: Now try to drop any written-back buffers from the journal's
+        // checkpoint lists.  We do this *before* commit because it potentially
+        // frees some memory.
+
+        log::debug!("Commit phase 1.");
+
+        // TODO: Clear revoked flag to reflect there is no revoked buffers
+        // in the next transaction which is going to be started.
+
+        commit_tx.state = TransactionState::Flush;
+        drop(commit_tx);
+
+        states.committing_transaction = states.running_transaction.clone();
+        states.running_transaction = None;
+        let mut commit_tx = states.committing_transaction.as_ref().unwrap().lock();
+        let start_time = self.system.get_time();
+        commit_tx.log_start = start_time as u32;
+        // TODO: wake_up(&journal->j_wait_transaction_locked);
+        drop(commit_tx);
+        drop(states);
+
+        log::debug!("Commit phase 2.");
+
+        // Now start flushing things to disk, in the order they appear
+        // on the transaction lists.  Data blocks go first.
+        // self.
+    }
+
+    fn submit_data_buffers(&self, transaction: &mut MutexGuard<Transaction>) {
+        let mut lists = transaction.lists.lock();
+        let datalist = lists.sync_datalist.0.clone();
+        lists.sync_datalist.0.clear();
+        for jb in datalist.into_iter() {
+            let jb = jb.lock();
+            let mut buf = jb.buf.lock();
+        }
     }
 }
 
@@ -316,7 +392,7 @@ impl Journal {
 
     /// Update a journal's dynamic superblock fields and write it to disk,
     /// ~~optionally waiting for the IO to complete~~.
-    fn update_superblock(&mut self) {
+    fn update_superblock(&self) {
         let mut sb_guard = self.sb_buffer.lock();
         let sb = Self::superblock_mut(&mut sb_guard);
         let mut states = self.states.lock();
