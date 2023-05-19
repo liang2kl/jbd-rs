@@ -1,13 +1,12 @@
 //! The system abstraction layer.
 // TODO: jbd_alloc, jbd_free
-use core::{any::Any, marker::PhantomData};
+use core::{any::Any, cell::RefCell};
 extern crate alloc;
-use alloc::{boxed::Box, sync::Arc};
-use spin::Mutex;
+use alloc::{boxed::Box, rc::Rc};
 
 use crate::tx::{Handle, JournalBuffer};
 
-pub trait BlockDevice: Send + Sync + Any {
+pub trait BlockDevice: Any {
     /// Read data form block to buffer
     fn read_block(&self, block_id: usize, buf: &mut [u8]);
     /// Write data from buffer to block
@@ -16,8 +15,8 @@ pub trait BlockDevice: Send + Sync + Any {
     fn block_size(&self) -> usize;
 }
 
-pub trait Buffer: Send + Sync + Any {
-    fn device(&self) -> Arc<dyn BlockDevice>;
+pub trait Buffer: Any {
+    fn device(&self) -> Rc<dyn BlockDevice>;
     fn block_id(&self) -> usize;
     fn size(&self) -> usize;
     fn dirty(&self) -> bool;
@@ -25,24 +24,22 @@ pub trait Buffer: Send + Sync + Any {
 
     // Related methods of the `private` field of `struct buffer_head`
     fn private(&self) -> &Option<Box<dyn Any>>;
-    fn set_private(&mut self, private: Option<Box<dyn Any>>);
+    fn set_private(&self, private: Option<Box<dyn Any>>);
 
     // Normal writeback control. JBD might alter the related states
     // to control writeback behaviours.
-    fn mark_dirty(&mut self);
-    fn clear_dirty(&mut self);
-    fn test_clear_dirty(&mut self) -> bool;
-    fn sync(&mut self);
+    fn mark_dirty(&self);
+    fn clear_dirty(&self);
+    fn test_clear_dirty(&self) -> bool;
+    fn sync(&self);
 
     // JBD-specific state management. The related states should only
     // be altered by JBD.
     fn jbd_managed(&self) -> bool;
-    fn set_jbd_managed(&mut self, managed: bool);
-    fn lock_jbd(&mut self);
-    fn unlock_jbd(&mut self);
-    fn mark_jbd_dirty(&mut self);
-    fn clear_jbd_dirty(&mut self);
-    fn test_clear_jbd_dirty(&mut self) -> bool;
+    fn set_jbd_managed(&self, managed: bool);
+    fn mark_jbd_dirty(&self);
+    fn clear_jbd_dirty(&self);
+    fn test_clear_jbd_dirty(&self) -> bool;
     fn jbd_dirty(&self) -> bool;
 }
 
@@ -51,7 +48,7 @@ impl dyn Buffer {
         unsafe { core::slice::from_raw_parts(self.data(), self.size()) }
     }
 
-    pub(crate) fn buf_mut(&mut self) -> &mut [u8] {
+    pub(crate) fn buf_mut(&self) -> &mut [u8] {
         self.mark_dirty();
         unsafe { core::slice::from_raw_parts_mut(self.data(), self.size()) }
     }
@@ -60,32 +57,32 @@ impl dyn Buffer {
         unsafe { &*(self.data() as *const T) }
     }
 
-    pub(crate) fn convert_mut<T>(&mut self) -> &mut T {
+    pub(crate) fn convert_mut<T>(&self) -> &mut T {
         self.mark_dirty();
         unsafe { &mut *(self.data() as *mut T) }
     }
 
-    pub(crate) fn journal_buffer(&self) -> Option<Arc<Mutex<JournalBuffer>>> {
+    pub(crate) fn journal_buffer(&self) -> Option<Rc<RefCell<JournalBuffer>>> {
         self.private()
             .as_deref()?
             .downcast_ref()
-            .map(|x: &Arc<Mutex<JournalBuffer>>| x.clone())
+            .map(|x: &Rc<RefCell<JournalBuffer>>| x.clone())
     }
 
-    pub(crate) fn set_journal_buffer(&mut self, jb: Arc<Mutex<JournalBuffer>>) {
+    pub(crate) fn set_journal_buffer(&self, jb: Rc<RefCell<JournalBuffer>>) {
         self.set_jbd_managed(true);
         self.set_private(Some(Box::new(jb)));
     }
 }
 
-pub trait BufferProvider: Send + Sync + Any {
-    fn get_buffer(&mut self, dev: Arc<dyn BlockDevice>, block_id: usize) -> Option<Arc<Mutex<dyn Buffer>>>;
-    fn sync(&mut self) -> bool;
+pub trait BufferProvider: Any {
+    fn get_buffer(&self, dev: Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>>;
+    fn sync(&self) -> bool;
 }
 
-pub trait System: Send + Sync + Any {
-    fn get_buffer_provider(&self) -> Arc<Mutex<dyn BufferProvider>>;
+pub trait System: Any {
+    fn get_buffer_provider(&self) -> Rc<dyn BufferProvider>;
     fn get_time(&self) -> usize;
-    fn get_current_handle(&self) -> Option<Arc<Mutex<Handle>>>;
-    fn set_current_handle(&self, handle: Option<Arc<Mutex<Handle>>>);
+    fn get_current_handle(&self) -> Option<Rc<RefCell<Handle>>>;
+    fn set_current_handle(&self, handle: Option<Rc<RefCell<Handle>>>);
 }

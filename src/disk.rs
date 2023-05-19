@@ -46,6 +46,7 @@ bitflags! {
 }
 
 /// Standard header for all descriptor blocks.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Header {
     pub magic: u32,

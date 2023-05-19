@@ -18,5 +18,5 @@ default = []
 [dependencies]
 cfg-if = "1.0"
 bitflags = "1.2.1"
-spin = "0.7.0"
+# spin = "0.7.0"
 log = "0.4"

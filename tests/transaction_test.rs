@@ -1,6 +1,6 @@
 mod common;
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use common::create_handle;
 
@@ -12,5 +12,5 @@ fn test_create_handle() {
     let handle1 = create_handle(journal.clone()).unwrap();
     let handle2 = create_handle(journal.clone()).unwrap();
     // Each process has a singleton handle.
-    assert!(Arc::ptr_eq(&handle1, &handle2));
+    assert!(Rc::ptr_eq(&handle1, &handle2));
 }

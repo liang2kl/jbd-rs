@@ -1,30 +1,49 @@
 extern crate alloc;
 
-use alloc::{
-    collections::LinkedList,
-    sync::{Arc, Weak},
-    vec::Vec,
+use core::{
+    borrow::Borrow,
+    cell::{Ref, RefCell},
 };
+
+use alloc::{collections::LinkedList, rc::Rc, sync::Weak, vec::Vec};
 use bitflags::bitflags;
-use spin::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 
 use crate::{
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
     disk::{BlockType, Superblock},
     err::{JBDError, JBDResult},
-    jbd_assert,
     sal::{BlockDevice, Buffer, System},
     tx::{Handle, Tid, Transaction, TransactionState},
 };
 
 pub struct Journal {
-    pub system: Arc<dyn System>,
-    pub sb_buffer: Arc<Mutex<dyn Buffer>>,
+    pub system: Rc<dyn System>,
+    pub sb_buffer: Rc<dyn Buffer>,
     pub format_version: i32,
-    /// Journal states protected by a single spin lock
-    pub states: Mutex<JournalStates>,
+    pub flags: JournalFlag,
+    pub errno: i32, // TODO: Strongly-typed error?
+    pub running_transaction: Option<Rc<RefCell<Transaction>>>,
+    pub committing_transaction: Option<Rc<RefCell<Transaction>>>,
+    /// Journal head: identifies the first unused block in the journal.
+    pub head: u32,
+    /// Journal tail: identifies the oldest still-used block in the journal
+    pub tail: u32,
+    /// Journal free: how many free blocks are there in the journal?
+    pub free: u32,
+    /// Journal start: the block number of the first usable block in the journal
+    pub first: u32,
+    /// Journal end: the block number of the last usable block in the journal
+    pub last: u32,
+    /// Sequence number of the oldest transaction in the log
+    pub tail_sequence: Tid,
+    /// Sequence number of the next transaction to grant
+    pub transaction_sequence: Tid,
+    /// Sequence number of the most recently committed transaction
+    pub commit_sequence: Tid,
+    /// Sequence number of the most recent transaction wanting commit
+    pub commit_request: Tid,
     /// List of all transactions waiting for checkpointing
-    pub checkpoint_transactions: Mutex<LinkedList<Arc<Mutex<Transaction>>>>,
+    pub checkpoint_transactions: LinkedList<Rc<RefCell<Transaction>>>,
     /// Block devices
     pub devs: JournalDevs,
     /// Total maximum capacity of the journal region on disk
@@ -33,11 +52,7 @@ pub struct Journal {
     /// commit transaction
     pub max_transaction_buffers: u32,
     // commit_interval: usize,
-    // wbuf: Vec<Option<Arc<BufferHead>>>,
-    /// This lock owns nothing. Instead, it is used to serialize access
-    /// to the stuff protected by j_list_lock in Linux. Note that access to
-    /// transaction's lists requires transaction's lock (in Rust), too.
-    pub list_lock: Mutex<()>,
+    // wbuf: Vec<Option<Rc<BufferHead>>>,
 }
 
 bitflags! {
@@ -53,17 +68,17 @@ bitflags! {
 }
 
 pub struct JournalDevs {
-    dev: Arc<dyn BlockDevice>,
+    dev: Rc<dyn BlockDevice>,
     blk_offset: u32,
-    fs_dev: Arc<dyn BlockDevice>,
+    fs_dev: Rc<dyn BlockDevice>,
 }
 
 /// Journal states protected by a single spin lock in Linux.
 pub struct JournalStates {
     pub flags: JournalFlag,
     pub errno: i32, // TODO: Strongly-typed error?
-    pub running_transaction: Option<Arc<Mutex<Transaction>>>,
-    pub committing_transaction: Option<Arc<Mutex<Transaction>>>,
+    pub running_transaction: Option<Rc<Transaction>>,
+    pub committing_transaction: Option<Rc<Transaction>>,
     /// Journal head: identifies the first unused block in the journal.
     pub head: u32,
     /// Journal tail: identifies the oldest still-used block in the journal
@@ -88,11 +103,11 @@ pub struct JournalStates {
 struct RevokeTable;
 
 pub struct JournalHead {
-    bh: Weak<Mutex<dyn Buffer>>,
+    bh: Weak<dyn Buffer>,
 }
 
 impl JournalHead {
-    pub fn new(bh: Weak<Mutex<dyn Buffer>>) -> Self {
+    pub fn new(bh: Weak<dyn Buffer>) -> Self {
         Self { bh }
     }
 }
@@ -101,9 +116,9 @@ impl JournalHead {
 impl Journal {
     /// Initialize an in-memory journal structure with a block device.
     pub fn init_dev(
-        system: Arc<dyn System>,
-        dev: Arc<dyn BlockDevice>,
-        fs_dev: Arc<dyn BlockDevice>,
+        system: Rc<dyn System>,
+        dev: Rc<dyn BlockDevice>,
+        fs_dev: Rc<dyn BlockDevice>,
         start: u32,
         len: u32,
     ) -> JBDResult<Self> {
@@ -114,7 +129,6 @@ impl Journal {
         };
         let sb_buffer = system
             .get_buffer_provider()
-            .lock()
             .get_buffer(devs.dev.clone(), devs.blk_offset as usize);
         if sb_buffer.is_none() {
             return Err(JBDError::IOError);
@@ -124,26 +138,23 @@ impl Journal {
             system: system.clone(),
             sb_buffer: sb_buffer.unwrap(),
             format_version: 0,
-            states: Mutex::new(JournalStates {
-                flags: JournalFlag::ABORT,
-                errno: 0,
-                running_transaction: None,
-                committing_transaction: None,
-                head: 0,
-                tail: 0,
-                free: 0,
-                first: 0,
-                last: 0,
-                tail_sequence: 0,
-                transaction_sequence: 0,
-                commit_sequence: 0,
-                commit_request: 0,
-            }),
-            checkpoint_transactions: Mutex::new(LinkedList::new()),
+            flags: JournalFlag::ABORT,
+            errno: 0,
+            running_transaction: None,
+            committing_transaction: None,
+            head: 0,
+            tail: 0,
+            free: 0,
+            first: 0,
+            last: 0,
+            tail_sequence: 0,
+            transaction_sequence: 0,
+            commit_sequence: 0,
+            commit_request: 0,
+            checkpoint_transactions: LinkedList::new(),
             devs,
             maxlen: len,
             max_transaction_buffers: 0,
-            list_lock: Mutex::new(()),
         };
 
         Ok(ret)
@@ -159,8 +170,7 @@ impl Journal {
         log::debug!("Zeroing out journal blocks.");
         for i in 0..self.maxlen {
             let block_id = i;
-            let page_head_locked = self.get_buffer(block_id)?;
-            let mut page_head = page_head_locked.lock();
+            let page_head = self.get_buffer(block_id)?;
             let buf = page_head.buf_mut();
             buf.fill(0);
         }
@@ -169,8 +179,7 @@ impl Journal {
         self.sync_buf()?;
         log::debug!("Journal cleared.");
 
-        let mut sb_guard = self.sb_buffer.lock();
-        let sb = Self::superblock_mut(&mut sb_guard);
+        let sb = self.superblock_mut();
 
         sb.header.magic = JFS_MAGIC_NUMBER.to_be();
         sb.header.block_type = <BlockType as Into<u32>>::into(BlockType::SuperblockV2).to_be();
@@ -178,13 +187,10 @@ impl Journal {
         sb.block_size = (self.devs.dev.block_size() as u32).to_be();
         sb.maxlen = self.maxlen.to_be();
         sb.first = 1_u32.to_be();
-        drop(sb_guard);
 
-        let mut states = self.states.lock();
-        states.transaction_sequence = 1;
+        self.transaction_sequence = 1;
 
-        states.flags.remove(JournalFlag::ABORT);
-        drop(states);
+        self.flags.remove(JournalFlag::ABORT);
 
         self.format_version = 2;
 
@@ -197,9 +203,8 @@ impl Journal {
         // TODO: self.recover()?;
         self.reset()?;
 
-        let mut states = self.states.lock();
-        states.flags.remove(JournalFlag::ABORT);
-        states.flags.insert(JournalFlag::LOADED);
+        self.flags.remove(JournalFlag::ABORT);
+        self.flags.insert(JournalFlag::LOADED);
 
         Ok(())
     }
@@ -228,16 +233,21 @@ impl Journal {
         todo!()
     }
 
-    pub fn start(journal: Arc<RwLock<Journal>>, nblocks: u32) -> JBDResult<Arc<Mutex<Handle>>> {
-        let journal_guard = journal.write();
-        if let Some(current_handle) = journal_guard.system.get_current_handle() {
+    pub fn start(journal_rc: Rc<RefCell<Journal>>, nblocks: u32) -> JBDResult<Rc<RefCell<Handle>>> {
+        let journal = journal_rc.as_ref().borrow();
+        if let Some(current_handle) = journal.system.get_current_handle() {
             return Ok(current_handle.clone());
         }
         let mut handle = Handle::new(nblocks);
-        start_handle(journal.clone(), &journal_guard, &mut handle)?;
-        let handle = Arc::new(Mutex::new(handle));
-        journal_guard.system.set_current_handle(Some(handle.clone()));
-        return Ok(handle);
+        drop(journal);
+        start_handle(&journal_rc, &mut handle)?;
+        let handle = Rc::new(RefCell::new(handle));
+        journal_rc
+            .as_ref()
+            .borrow()
+            .system
+            .set_current_handle(Some(handle.clone()));
+        Ok(handle)
     }
 }
 
@@ -246,41 +256,35 @@ impl Journal {
     pub fn commit_transaction(&mut self) {
         // First job: lock down the current transaction and wait for
         // all outstanding updates to complete.
-        let mut states = self.states.lock();
-        if states.flags.contains(JournalFlag::FLUSHED) {
-            drop(states);
+        if self.flags.contains(JournalFlag::FLUSHED) {
             self.update_superblock();
-            states = self.states.lock();
         }
-        assert!(states.running_transaction.is_some());
-        assert!(states.committing_transaction.is_none());
+        assert!(self.running_transaction.is_some());
+        assert!(self.committing_transaction.is_none());
 
-        let mut commit_tx = states.running_transaction.as_mut().unwrap().lock();
+        let mut commit_tx = self.running_transaction.as_mut().unwrap().borrow_mut();
         assert!(commit_tx.state == TransactionState::Running);
 
         log::debug!("Start committing transaction {}.", commit_tx.tid);
         commit_tx.state = TransactionState::Locked;
 
-        let handle_info = commit_tx.handle_info.lock();
-        while handle_info.updates > 0 {
+        while commit_tx.updates > 0 {
             todo!("wait for updates to complete");
         }
 
-        assert!(handle_info.outstanding_credits <= self.max_transaction_buffers);
-        drop(handle_info);
+        assert!(commit_tx.outstanding_credits <= self.max_transaction_buffers);
 
-        let mut tx_lists = commit_tx.lists.lock();
-        let mut reserved_list: Vec<_> = tx_lists.reserved_list.0.clone();
-        tx_lists.reserved_list.0.clear();
-        drop(tx_lists);
+        let mut reserved_list: Vec<_> = commit_tx.reserved_list.0.clone();
+        commit_tx.reserved_list.0.clear();
 
-        for jb_binding in reserved_list.into_iter() {
-            let mut jb = jb_binding.lock();
-            if jb.commited_data.is_some() {
-                let _ = jb.buf.lock();
-                jb.commited_data = None;
+        for jb_rc in reserved_list.into_iter() {
+            {
+                let mut jb = jb_rc.borrow_mut();
+                if jb.commited_data.is_some() {
+                    jb.commited_data = None;
+                }
             }
-            Transaction::refile_buffer(&jb_binding, &mut jb);
+            Transaction::refile_buffer(&jb_rc);
         }
 
         // TODO: Now try to drop any written-back buffers from the journal's
@@ -295,14 +299,11 @@ impl Journal {
         commit_tx.state = TransactionState::Flush;
         drop(commit_tx);
 
-        states.committing_transaction = states.running_transaction.clone();
-        states.running_transaction = None;
-        let mut commit_tx = states.committing_transaction.as_ref().unwrap().lock();
+        self.committing_transaction = self.running_transaction.clone();
+        self.running_transaction = None;
+        let mut commit_tx = self.running_transaction.as_mut().unwrap().borrow_mut();
         let start_time = self.system.get_time();
         commit_tx.log_start = start_time as u32;
-        // TODO: wake_up(&journal->j_wait_transaction_locked);
-        drop(commit_tx);
-        drop(states);
 
         log::debug!("Commit phase 2.");
 
@@ -311,14 +312,13 @@ impl Journal {
         // self.
     }
 
-    fn submit_data_buffers(&self, transaction: &mut MutexGuard<Transaction>) {
-        let mut lists = transaction.lists.lock();
-        let datalist = lists.sync_datalist.0.clone();
-        lists.sync_datalist.0.clear();
-        for jb in datalist.into_iter() {
-            let jb = jb.lock();
-            let mut buf = jb.buf.lock();
-        }
+    fn submit_data_buffers(&self, transaction: &mut Transaction) {
+        // let datalist = transaction.sync_datalist.0.clone();
+        // transaction.sync_datalist.0.clear();
+        // for jb in datalist.into_iter() {
+        //     let jb = jb.lock();
+        //     let mut buf = transaction.buf;
+        // }
     }
 }
 
@@ -340,12 +340,10 @@ impl Journal {
     /// a journal, and after recovering an old journal to reset it for
     /// subsequent use.
     fn reset(&mut self) -> JBDResult {
-        let mut sb_guard = self.sb_buffer.lock();
-        let sb = Self::superblock_mut(&mut sb_guard);
+        let sb = self.superblock_mut();
 
         let first = u32::from_be(sb.first);
         let last = u32::from_be(sb.maxlen);
-        drop(sb_guard);
 
         if first + JFS_MIN_JOURNAL_BLOCKS > last + 1 {
             log::error!("Journal too small: blocks {}-{}.", first, last);
@@ -353,18 +351,16 @@ impl Journal {
             return Err(JBDError::InvalidJournalSize);
         }
 
-        let mut states = self.states.lock();
-        states.first = first;
-        states.last = last;
+        self.first = first;
+        self.last = last;
 
-        states.head = first;
-        states.tail = first;
-        states.free = last - first;
+        self.head = first;
+        self.tail = first;
+        self.free = last - first;
 
-        states.tail_sequence = states.transaction_sequence;
-        states.commit_sequence = states.transaction_sequence - 1;
-        states.commit_request = states.commit_sequence;
-        drop(states);
+        self.tail_sequence = self.transaction_sequence;
+        self.commit_sequence = self.transaction_sequence - 1;
+        self.commit_request = self.commit_sequence;
 
         self.max_transaction_buffers = self.maxlen / 4;
 
@@ -377,51 +373,54 @@ impl Journal {
     fn load_superblock(&mut self) -> JBDResult {
         self.validate_superblock()?;
 
-        let sb_guard = self.sb_buffer.lock();
-        let sb = Self::superblock_ref(&sb_guard);
-        let mut states = self.states.lock();
+        let sb = self.superblock_ref();
 
-        states.tail_sequence = u32::from_be(sb.sequence) as u16;
-        states.tail = u32::from_be(sb.start);
-        states.first = u32::from_be(sb.first);
-        states.last = u32::from_be(sb.maxlen);
-        states.errno = i32::from_be(sb.errno);
+        let tail_sequence = u32::from_be(sb.sequence) as u16;
+        let tail = u32::from_be(sb.start);
+        let first = u32::from_be(sb.first);
+        let last = u32::from_be(sb.maxlen);
+        let errno = i32::from_be(sb.errno);
+
+        drop(sb);
+
+        self.tail_sequence = tail_sequence;
+        self.tail = tail;
+        self.first = first;
+        self.last = last;
+        self.errno = errno;
 
         Ok(())
     }
 
     /// Update a journal's dynamic superblock fields and write it to disk,
     /// ~~optionally waiting for the IO to complete~~.
-    fn update_superblock(&self) {
-        let mut sb_guard = self.sb_buffer.lock();
-        let sb = Self::superblock_mut(&mut sb_guard);
-        let mut states = self.states.lock();
+    fn update_superblock(&mut self) {
+        let sb = self.superblock_mut();
 
-        if sb.start == 0 && states.tail_sequence == states.transaction_sequence {
+        if sb.start == 0 && self.tail_sequence == self.transaction_sequence {
             log::debug!("Skipping superblock update on newly created / recovered journal.");
-            states.flags.insert(JournalFlag::FLUSHED);
+            self.flags.insert(JournalFlag::FLUSHED);
             return;
         }
 
         log::debug!("Updating superblock.");
-        sb.sequence = (states.tail_sequence as u32).to_be();
-        sb.start = states.tail.to_be();
-        sb.errno = states.errno;
+        sb.sequence = (self.tail_sequence as u32).to_be();
+        sb.start = self.tail.to_be();
+        sb.errno = self.errno;
 
-        sb_guard.sync();
+        self.sb_buffer.sync();
 
-        if states.tail != 0 {
-            states.flags.insert(JournalFlag::FLUSHED);
+        if self.tail != 0 {
+            self.flags.insert(JournalFlag::FLUSHED);
         } else {
-            states.flags.remove(JournalFlag::FLUSHED);
+            self.flags.remove(JournalFlag::FLUSHED);
         }
     }
 
     fn validate_superblock(&mut self) -> JBDResult {
         // No need to test buffer_uptodate here as in our implementation as far,
         // the buffer will always be valid.
-        let sb_guard = self.sb_buffer.lock();
-        let sb = Self::superblock_ref(&sb_guard);
+        let sb = self.superblock_ref();
 
         if sb.header.magic != JFS_MAGIC_NUMBER.to_be() || sb.block_size != (self.devs.dev.block_size() as u32).to_be() {
             log::error!("Invalid journal superblock magic number or block size.");
@@ -429,6 +428,8 @@ impl Journal {
         }
 
         let block_type: BlockType = u32::from_be(sb.header.block_type).try_into()?;
+
+        drop(sb);
 
         match block_type {
             BlockType::SuperblockV1 => self.format_version = 1,
@@ -439,15 +440,15 @@ impl Journal {
             }
         }
 
-        if u32::from_be(sb.maxlen) <= self.maxlen {
-            self.maxlen = u32::from_be(sb.maxlen);
+        if u32::from_be(self.superblock_ref().maxlen) <= self.maxlen {
+            self.maxlen = u32::from_be(self.superblock_ref().maxlen);
         } else {
             log::error!("Journal too short.");
             // Linux returns -EINVAL here, so as we.
             return Err(JBDError::InvalidSuperblock);
         }
 
-        if u32::from_be(sb.first) == 0 || u32::from_be(sb.first) >= self.maxlen {
+        if u32::from_be(self.superblock_ref().first) == 0 || u32::from_be(self.superblock_ref().first) >= self.maxlen {
             log::error!("Journal has invalid start block.");
             return Err(JBDError::InvalidSuperblock);
         }
@@ -455,110 +456,107 @@ impl Journal {
         Ok(())
     }
 
-    fn superblock_ref<'a>(buf: &'a MutexGuard<dyn Buffer>) -> &'a Superblock {
-        buf.convert::<Superblock>()
+    fn superblock_ref<'a>(&'a self) -> &'a Superblock {
+        self.sb_buffer.convert::<Superblock>()
     }
 
-    fn superblock_mut<'a>(buf: &'a mut MutexGuard<dyn Buffer>) -> &'a mut Superblock {
-        buf.convert_mut::<Superblock>()
+    fn superblock_mut<'a>(&'a self) -> &'a mut Superblock {
+        self.sb_buffer.convert_mut::<Superblock>()
     }
 
-    fn get_buffer(&mut self, block_id: u32) -> JBDResult<Arc<Mutex<dyn Buffer>>> {
+    fn get_buffer(&mut self, block_id: u32) -> JBDResult<Rc<dyn Buffer>> {
         self.system
             .get_buffer_provider()
-            .lock()
             .get_buffer(self.devs.dev.clone(), block_id as usize)
             .map_or(Err(JBDError::IOError), |bh| Ok(bh))
     }
 
     fn sync_buf(&mut self) -> JBDResult {
-        if self.system.get_buffer_provider().lock().sync() {
+        if self.system.get_buffer_provider().sync() {
             Ok(())
         } else {
             Err(JBDError::IOError)
         }
     }
+
+    /// Start a new transaction in the journal, equivalent to get_transaction()
+    /// in linux.
+    fn set_transaction(&mut self, tx: &Rc<RefCell<Transaction>>) {
+        {
+            let mut tx_mut = tx.borrow_mut();
+            tx_mut.state = TransactionState::Running;
+            tx_mut.start_time = self.system.get_time();
+            tx_mut.tid = self.transaction_sequence;
+        }
+        self.transaction_sequence += 1;
+        // TODO: tx.expires
+        self.running_transaction = Some(tx.clone());
+    }
+
+    pub(crate) fn log_space_left(&self) -> u32 {
+        let mut left = self.free;
+        left -= MIN_LOG_RESERVED_BLOCKS;
+        if left <= 0 {
+            0
+        } else {
+            left - (left >> 3)
+        }
+    }
 }
 
-pub(crate) fn start_handle(
-    journal_ref: Arc<RwLock<Journal>>,
-    journal_guard: &RwLockWriteGuard<Journal>,
-    handle: &mut Handle,
-) -> JBDResult {
+pub(crate) fn start_handle(journal_rc: &Rc<RefCell<Journal>>, handle: &mut Handle) -> JBDResult {
+    let mut journal = journal_rc.borrow_mut();
     let nblocks = handle.buffer_credits;
 
-    if nblocks > journal_guard.max_transaction_buffers {
+    if nblocks > journal.max_transaction_buffers {
         log::error!(
             "Transaction requires too many credits ({} > {}).",
             nblocks,
-            journal_guard.max_transaction_buffers
+            journal.max_transaction_buffers
         );
         return Err(JBDError::NotEnoughSpace);
     }
 
-    let system = &journal_guard.system;
+    let system = &journal.system;
 
     log::debug!("New handle going live.");
 
-    let mut states: MutexGuard<JournalStates> = journal_guard.states.lock();
-    if states.flags.contains(JournalFlag::ABORT) || (states.errno != 0 && !states.flags.contains(JournalFlag::ACK_ERR))
+    if journal.flags.contains(JournalFlag::ABORT)
+        || (journal.errno != 0 && !journal.flags.contains(JournalFlag::ACK_ERR))
     {
         log::error!("Journal has aborted.");
         return Err(JBDError::IOError);
     }
 
-    if states.running_transaction.is_none() {
-        let tx = Transaction::new(Arc::downgrade(&journal_ref.clone()));
-        let tx = Arc::new(Mutex::new(tx));
-        set_transaction(&mut states, &system, &tx);
+    if journal.running_transaction.is_none() {
+        let tx = Transaction::new(Rc::downgrade(journal_rc));
+        let tx = Rc::new(RefCell::new(tx));
+        journal.set_transaction(&tx);
     }
 
-    let transaction_rc = states.running_transaction.as_ref().unwrap().clone();
-    let transaction = transaction_rc.lock();
+    let transaction_rc = journal.running_transaction.as_ref().unwrap().clone();
+    let mut transaction = journal.running_transaction.as_ref().unwrap().borrow_mut();
 
     if transaction.state == TransactionState::Locked {
         todo!("Wait for transaction to unlock.");
     }
 
-    let mut handle_info = transaction.handle_info.lock();
-    let needed = handle_info.outstanding_credits as u32 + nblocks;
+    let needed = transaction.outstanding_credits as u32 + nblocks;
 
-    if needed > journal_guard.max_transaction_buffers {
+    if needed > journal.max_transaction_buffers {
         todo!("Wait for previous transaction to commit.");
     }
 
-    if log_space_left(&states) < needed {
+    if journal.log_space_left() < needed {
         todo!("Wait for checkpoint.");
     }
 
-    handle.transaction = Some(transaction_rc.clone());
-    handle_info.outstanding_credits += nblocks;
-    handle_info.updates += 1;
-    handle_info.handle_count += 1;
+    handle.transaction = Some(transaction_rc);
+    transaction.outstanding_credits += nblocks;
+    transaction.updates += 1;
+    transaction.handle_count += 1;
 
-    log::debug!("Handle now has {} credits.", handle_info.outstanding_credits);
+    log::debug!("Handle now has {} credits.", transaction.outstanding_credits);
 
     return Ok(());
-}
-
-/// Start a new transaction in the journal, equivalent to get_transaction()
-/// in linux.
-fn set_transaction(states: &mut MutexGuard<JournalStates>, system: &Arc<dyn System>, tx_rc: &Arc<Mutex<Transaction>>) {
-    let mut tx = tx_rc.lock();
-    tx.state = TransactionState::Running;
-    tx.start_time = system.get_time();
-    tx.tid = states.transaction_sequence;
-    states.transaction_sequence += 1;
-    // TODO: tx.expires
-    states.running_transaction = Some(tx_rc.clone());
-}
-
-pub(crate) fn log_space_left(states: &MutexGuard<JournalStates>) -> u32 {
-    let mut left = states.free;
-    left -= MIN_LOG_RESERVED_BLOCKS;
-    if left <= 0 {
-        0
-    } else {
-        left - (left >> 3)
-    }
 }
