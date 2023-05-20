@@ -76,7 +76,7 @@ impl dyn Buffer {
 }
 
 pub trait BufferProvider: Any {
-    fn get_buffer(&self, dev: Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>>;
+    fn get_buffer(&self, dev: &Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>>;
     fn sync(&self) -> bool;
 }
 

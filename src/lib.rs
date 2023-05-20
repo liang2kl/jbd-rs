@@ -3,7 +3,7 @@
 mod config;
 mod disk;
 pub mod err;
-mod journal;
+pub mod journal;
 pub mod sal;
 mod tx;
 mod util;

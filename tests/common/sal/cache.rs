@@ -113,6 +113,7 @@ impl Buffer for BlockCache {
         }
         drop(inner);
         self.clear_dirty();
+        log::debug!("sync block {}", self.block_id());
     }
 
     fn mark_jbd_dirty(&self) {
@@ -137,6 +138,17 @@ impl Buffer for BlockCache {
         let ret = self.inner().jbd_dirty;
         self.clear_jbd_dirty();
         ret
+    }
+}
+
+impl BlockCache {
+    pub fn get_buf(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.data(), self.size()) }
+    }
+
+    pub fn get_buf_mut(&self) -> &mut [u8] {
+        self.mark_dirty();
+        unsafe { core::slice::from_raw_parts_mut(self.data(), self.size()) }
     }
 }
 
@@ -165,7 +177,7 @@ impl BlockCacheManager {
 }
 
 impl BufferProvider for BlockCacheManager {
-    fn get_buffer(&self, dev: Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>> {
+    fn get_buffer(&self, dev: &Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>> {
         let mut queue = self.queue.borrow_mut();
         if let Some(pair) = queue.iter().find(|pair| pair.0 == block_id) {
             Some(Rc::clone(&pair.1))

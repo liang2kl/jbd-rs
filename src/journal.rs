@@ -1,8 +1,10 @@
 extern crate alloc;
 
 use core::{
-    borrow::Borrow,
+    borrow::{Borrow, BorrowMut},
     cell::{Ref, RefCell},
+    mem::{self, size_of},
+    ptr,
 };
 
 use alloc::{collections::LinkedList, rc::Rc, sync::Weak, vec::Vec};
@@ -10,10 +12,10 @@ use bitflags::bitflags;
 
 use crate::{
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
-    disk::{BlockType, Superblock},
+    disk::{BlockTag, BlockType, Header, Superblock, TagFlag},
     err::{JBDError, JBDResult},
     sal::{BlockDevice, Buffer, System},
-    tx::{Handle, Tid, Transaction, TransactionState},
+    tx::{BufferListType, Handle, JournalBuffer, Tid, Transaction, TransactionState},
 };
 
 pub struct Journal {
@@ -52,7 +54,7 @@ pub struct Journal {
     /// commit transaction
     pub max_transaction_buffers: u32,
     // commit_interval: usize,
-    // wbuf: Vec<Option<Rc<BufferHead>>>,
+    pub wbuf: Vec<Rc<dyn Buffer>>,
 }
 
 bitflags! {
@@ -102,16 +104,6 @@ pub struct JournalStates {
 
 struct RevokeTable;
 
-pub struct JournalHead {
-    bh: Weak<dyn Buffer>,
-}
-
-impl JournalHead {
-    pub fn new(bh: Weak<dyn Buffer>) -> Self {
-        Self { bh }
-    }
-}
-
 /// Public interfaces.
 impl Journal {
     /// Initialize an in-memory journal structure with a block device.
@@ -129,7 +121,7 @@ impl Journal {
         };
         let sb_buffer = system
             .get_buffer_provider()
-            .get_buffer(devs.dev.clone(), devs.blk_offset as usize);
+            .get_buffer(&devs.dev, devs.blk_offset as usize);
         if sb_buffer.is_none() {
             return Err(JBDError::IOError);
         }
@@ -155,6 +147,7 @@ impl Journal {
             devs,
             maxlen: len,
             max_transaction_buffers: 0,
+            wbuf: Vec::new(),
         };
 
         Ok(ret)
@@ -253,7 +246,7 @@ impl Journal {
 
 /// Commit related interfaces.
 impl Journal {
-    pub fn commit_transaction(&mut self) {
+    pub fn commit_transaction(&mut self) -> JBDResult {
         // First job: lock down the current transaction and wait for
         // all outstanding updates to complete.
         if self.flags.contains(JournalFlag::FLUSHED) {
@@ -262,29 +255,21 @@ impl Journal {
         assert!(self.running_transaction.is_some());
         assert!(self.committing_transaction.is_none());
 
-        let mut commit_tx = self.running_transaction.as_mut().unwrap().borrow_mut();
+        let mut commit_tx = self.running_transaction.as_ref().unwrap().as_ref().borrow_mut();
         assert!(commit_tx.state == TransactionState::Running);
 
         log::debug!("Start committing transaction {}.", commit_tx.tid);
         commit_tx.state = TransactionState::Locked;
 
-        while commit_tx.updates > 0 {
-            todo!("wait for updates to complete");
-        }
-
+        assert!(commit_tx.updates == 0);
         assert!(commit_tx.outstanding_credits <= self.max_transaction_buffers);
 
-        let mut reserved_list: Vec<_> = commit_tx.reserved_list.0.clone();
-        commit_tx.reserved_list.0.clear();
-
-        for jb_rc in reserved_list.into_iter() {
-            {
-                let mut jb = jb_rc.borrow_mut();
-                if jb.commited_data.is_some() {
-                    jb.commited_data = None;
-                }
+        for jb_rc in commit_tx.reserved_list.0.clone().into_iter() {
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            if jb.commited_data.is_some() {
+                jb.commited_data = None;
             }
-            Transaction::refile_buffer(&jb_rc);
+            Transaction::refile_buffer(&jb_rc, &mut jb, &mut commit_tx);
         }
 
         // TODO: Now try to drop any written-back buffers from the journal's
@@ -301,7 +286,8 @@ impl Journal {
 
         self.committing_transaction = self.running_transaction.clone();
         self.running_transaction = None;
-        let mut commit_tx = self.running_transaction.as_mut().unwrap().borrow_mut();
+        let commit_tx_rc = self.committing_transaction.as_mut().unwrap().clone();
+        let mut commit_tx = commit_tx_rc.as_ref().borrow_mut();
         let start_time = self.system.get_time();
         commit_tx.log_start = start_time as u32;
 
@@ -310,15 +296,316 @@ impl Journal {
         // Now start flushing things to disk, in the order they appear
         // on the transaction lists.  Data blocks go first.
         // self.
+        self.submit_data_buffers(&commit_tx_rc, &mut commit_tx)?;
+
+        for jb_rc in commit_tx.locked_list.0.clone().into_iter() {
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            let buf = &jb.buf;
+
+            if buf.jbd_managed() && jb.jlist == BufferListType::Locked {
+                Transaction::unfile_buffer(&jb_rc, &mut jb, &mut commit_tx);
+            }
+        }
+
+        // TODO: write revoke records
+
+        assert!(commit_tx.sync_datalist.0.is_empty());
+
+        log::debug!("Commit phase 3.");
+
+        commit_tx.state = TransactionState::Commit;
+
+        assert!(commit_tx.nr_buffers <= commit_tx.outstanding_credits as i32);
+
+        let mut descriptor_rc: Option<Rc<RefCell<JournalBuffer>>> = None;
+        let mut first_tag = false;
+        let mut descriptor_buf_data: Option<*mut u8> = None;
+        let mut space_left = 0;
+
+        // Metadata list
+        let buffers = commit_tx.buffers.0.clone();
+        let buffer_count = buffers.len();
+
+        let mut refile_buffers = Vec::new();
+
+        for (i, jb_rc) in commit_tx.buffers.0.clone().into_iter().enumerate() {
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            if self.flags.contains(JournalFlag::ABORT) {
+                jb.buf.clear_jbd_dirty();
+                refile_buffers.push(jb_rc.clone());
+                continue;
+            }
+
+            if descriptor_rc.is_none() {
+                log::debug!("Get descriptor.");
+                descriptor_rc = Some(self.get_descriptor_buffer()?);
+                let descriptor_rc = descriptor_rc.as_mut().unwrap();
+                let descriptor = descriptor_rc.as_ref().borrow_mut();
+                let buf = &descriptor.buf;
+                let header: &mut Header = buf.convert_mut();
+                header.magic = JFS_MAGIC_NUMBER.to_be();
+                let block_type_host: u32 = BlockType::DescriptorBlock.into();
+                header.block_type = block_type_host.to_be();
+                header.sequence = (commit_tx.tid as u32).to_be();
+
+                buf.mark_dirty();
+                self.wbuf.push(buf.clone());
+                // Transaction::file_buffer(&commit_tx_rc, &descriptor_rc, &mut descriptor, BufferListType::LogCtl)?;
+                first_tag = true;
+                descriptor_buf_data = Some(buf.buf_mut()[size_of::<Header>()..].as_mut_ptr());
+                space_left = buf.size() - size_of::<Header>();
+            }
+
+            // Where is the buffer to be written?
+            let blocknr = self.next_log_block();
+
+            commit_tx.outstanding_credits -= 1;
+
+            let (new_jb_rc, do_escape, _) =
+                self.write_metadata_buffer(&commit_tx_rc, &mut commit_tx, &jb_rc, &mut jb, blocknr)?;
+            self.wbuf.push(new_jb_rc.as_ref().borrow().buf.clone());
+
+            let mut tag_flag = TagFlag::default();
+            if do_escape {
+                tag_flag.insert(TagFlag::ESCAPE);
+            }
+            if !first_tag {
+                tag_flag.insert(TagFlag::SAME_UUID);
+            }
+
+            let tag_mut = unsafe { mem::transmute::<_, &mut BlockTag>(descriptor_buf_data.as_mut().unwrap()) };
+            tag_mut.block_nr = (jb.buf.block_id() as u32).to_be();
+            tag_mut.flag = tag_flag.bits().to_be();
+            space_left -= size_of::<BlockTag>();
+
+            unsafe {
+                *descriptor_buf_data.as_mut().unwrap() = descriptor_buf_data
+                    .as_ref()
+                    .unwrap()
+                    .offset(size_of::<BlockTag>() as isize);
+            }
+
+            if first_tag {
+                // TODO: uuid
+                // let uuid_mut = unsafe { mem::transmute::<_, &mut [u8; 16]>(descriptor_buf_data.as_mut().unwrap()) };
+                unsafe {
+                    *descriptor_buf_data.as_mut().unwrap() = descriptor_buf_data.as_ref().unwrap().offset(16);
+                }
+                first_tag = false;
+                space_left -= 16;
+            }
+
+            // Submit IO
+            if i == buffer_count - 1 || space_left < size_of::<BlockTag>() + 16 {
+                log::debug!("Submit {} IO.", self.wbuf.len());
+                // Write an end-of-descriptor marker before submitting the IOs.
+                tag_flag.insert(TagFlag::LAST_TAG);
+                tag_mut.flag = tag_flag.bits().to_be();
+
+                for buf in self.wbuf.iter() {
+                    buf.mark_dirty();
+                    buf.sync();
+                }
+                self.wbuf.clear();
+
+                descriptor_rc = None;
+            }
+        }
+
+        for jb_rc in refile_buffers.into_iter() {
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            Transaction::refile_buffer(&jb_rc, &mut jb, &mut commit_tx);
+        }
+
+        // We don't need to wait for the buffer to be written, as they are synced.
+
+        log::debug!("Commit phase 4-5.");
+
+        // IO bufs
+        let iobuf_len = commit_tx.iobuf_list.0.len();
+        for i in 0..iobuf_len {
+            let jb_rc = &commit_tx.iobuf_list.0[i].clone();
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            Transaction::unfile_buffer(&jb_rc, &mut jb, &mut commit_tx);
+            let jb_rc = &commit_tx.shadow_list.0[i].clone();
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            Transaction::unfile_buffer(&jb_rc, &mut jb, &mut commit_tx);
+            Transaction::file_buffer(&commit_tx_rc, &mut commit_tx, jb_rc, &mut jb, BufferListType::Forget)?;
+        }
+
+        commit_tx.iobuf_list.0.clear();
+        commit_tx.shadow_list.0.clear();
+
+        log::debug!("Commit phase 6.");
+
+        assert!(commit_tx.state == TransactionState::Commit);
+        commit_tx.state = TransactionState::CommitRecord;
+        self.write_commit_record(&mut commit_tx)?;
+
+        log::debug!("Commit phase 7.");
+
+        assert!(commit_tx.sync_datalist.0.is_empty());
+        assert!(commit_tx.buffers.0.is_empty());
+        assert!(commit_tx.checkpoint_list.0.is_empty());
+        assert!(commit_tx.iobuf_list.0.is_empty());
+        assert!(commit_tx.shadow_list.0.is_empty());
+        assert!(commit_tx.log_list.0.is_empty());
+
+        // TODO: Checkpoints
+        // let forget_list = commit_tx.forget.0.clone();
+        // commit_tx.forget.0.clear();
+
+        // for jb_rc in forget_list {
+        //     let mut jb = jb_rc.as_ref().borrow_mut();
+        //     if jb.commited_data.is_some() {
+        //         jb.commited_data = None;
+        //         if jb.frozen_data.is_some() {
+        //             jb.commited_data = jb.frozen_data;
+        //             jb.frozen_data = None;
+        //         }
+        //     } else if jb.frozen_data.is_some() {
+        //         jb.frozen_data = None;
+        //     }
+        // }
+
+        log::debug!("Commit phase 8.");
+        commit_tx.state = TransactionState::Finished;
+
+        self.commit_sequence = commit_tx.tid;
+        self.committing_transaction = None;
+
+        // TODO: Checkpoint
+
+        log::debug!("Commit {} completed.", self.commit_sequence);
+
+        Ok(())
     }
 
-    fn submit_data_buffers(&self, transaction: &mut Transaction) {
-        // let datalist = transaction.sync_datalist.0.clone();
-        // transaction.sync_datalist.0.clear();
-        // for jb in datalist.into_iter() {
-        //     let jb = jb.lock();
-        //     let mut buf = transaction.buf;
-        // }
+    fn write_commit_record(&mut self, commit_tx: &mut Transaction) -> JBDResult {
+        if self.flags.contains(JournalFlag::ABORT) {
+            return Ok(());
+        }
+
+        let descriptor_rc = self.get_descriptor_buffer()?;
+        let descriptor = descriptor_rc.as_ref().borrow_mut();
+        let header: &mut Header = descriptor.buf.convert_mut();
+        header.magic = JFS_MAGIC_NUMBER.to_be();
+        let block_type_host: u32 = BlockType::CommitBlock.into();
+        header.block_type = block_type_host.to_be();
+        header.sequence = (commit_tx.tid as u32).to_be();
+
+        descriptor.buf.mark_dirty();
+        descriptor.buf.sync();
+
+        Ok(())
+    }
+
+    fn write_metadata_buffer(
+        &mut self,
+        tx_rc: &Rc<RefCell<Transaction>>,
+        tx: &mut Transaction,
+        jb_rc: &Rc<RefCell<JournalBuffer>>,
+        jb: &mut JournalBuffer,
+        blocknr: u32,
+    ) -> JBDResult<(Rc<RefCell<JournalBuffer>>, bool, bool)> {
+        let mut need_copy_out = false;
+        let mut done_copy_out = false;
+        let mut do_escape = false;
+
+        let buf = self.get_buffer(blocknr)?;
+
+        let new_jb_rc = JournalBuffer::new_or_get(&buf);
+
+        let (data, is_frozen) = if let Some(frozen_data) = &jb.frozen_data {
+            done_copy_out = true;
+            (&frozen_data[..], true)
+        } else {
+            (jb.buf.buf(), false)
+        };
+
+        // Check for escaping
+        if u32::from_be_bytes(data[..4].try_into().unwrap()) == JFS_MAGIC_NUMBER {
+            need_copy_out = true;
+            do_escape = true;
+        }
+
+        if need_copy_out && !done_copy_out {
+            let mut new_data: Vec<u8> = Vec::with_capacity(data.len());
+            new_data.resize(data.len(), 0);
+            new_data.copy_from_slice(data);
+
+            if do_escape {
+                new_data[0] = 0;
+            }
+
+            jb.frozen_data = Some(new_data);
+            done_copy_out = true;
+        } else {
+            if is_frozen {
+                jb.frozen_data.as_mut().unwrap()[0] = 0;
+            } else {
+                jb.buf.buf_mut()[0] = 0;
+            }
+        };
+
+        let mut new_jb = new_jb_rc.as_ref().borrow_mut();
+        new_jb.transaction = None;
+        new_jb.buf.mark_dirty();
+
+        Transaction::file_buffer(tx_rc, tx, jb_rc, jb, BufferListType::Shadow)?;
+        Transaction::file_buffer(tx_rc, tx, &new_jb_rc, &mut new_jb, BufferListType::IO)?;
+
+        Ok((new_jb_rc.clone(), do_escape, done_copy_out))
+    }
+
+    fn submit_data_buffers(&mut self, tx_rc: &Rc<RefCell<Transaction>>, tx: &mut Transaction) -> JBDResult {
+        let datalist = tx.sync_datalist.0.clone();
+        tx.sync_datalist.0.clear();
+
+        for jb_rc in datalist.into_iter() {
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            let buf = &jb.buf;
+
+            assert!(buf.jbd_managed());
+
+            if buf.test_clear_dirty() {
+                self.wbuf.push(buf.clone());
+                Transaction::file_buffer(tx_rc, tx, &jb_rc, &mut jb, BufferListType::Locked)?;
+            } else {
+                Transaction::unfile_buffer(&jb_rc, &mut jb, tx);
+            }
+        }
+
+        self.do_submit_data();
+
+        Ok(())
+    }
+
+    fn do_submit_data(&mut self) {
+        for buf in self.wbuf.iter() {
+            buf.sync();
+        }
+        self.wbuf.clear();
+    }
+
+    fn get_descriptor_buffer(&mut self) -> JBDResult<Rc<RefCell<JournalBuffer>>> {
+        let blocknr = self.next_log_block();
+        let buf = self.get_buffer(blocknr)?;
+        buf.buf_mut().fill(0);
+
+        Ok(JournalBuffer::new_or_get(&buf))
+    }
+
+    fn next_log_block(&mut self) -> u32 {
+        assert!(self.free > 1);
+        let block = self.head;
+        self.head += 1;
+        self.free -= 1;
+        if self.head == self.last {
+            self.head = self.first;
+        }
+        // TODO: bmap
+        block
     }
 }
 
@@ -467,7 +754,7 @@ impl Journal {
     fn get_buffer(&mut self, block_id: u32) -> JBDResult<Rc<dyn Buffer>> {
         self.system
             .get_buffer_provider()
-            .get_buffer(self.devs.dev.clone(), block_id as usize)
+            .get_buffer(&self.devs.dev, (block_id + self.devs.blk_offset) as usize)
             .map_or(Err(JBDError::IOError), |bh| Ok(bh))
     }
 
@@ -483,7 +770,7 @@ impl Journal {
     /// in linux.
     fn set_transaction(&mut self, tx: &Rc<RefCell<Transaction>>) {
         {
-            let mut tx_mut = tx.borrow_mut();
+            let mut tx_mut = tx.as_ref().borrow_mut();
             tx_mut.state = TransactionState::Running;
             tx_mut.start_time = self.system.get_time();
             tx_mut.tid = self.transaction_sequence;
@@ -505,7 +792,7 @@ impl Journal {
 }
 
 pub(crate) fn start_handle(journal_rc: &Rc<RefCell<Journal>>, handle: &mut Handle) -> JBDResult {
-    let mut journal = journal_rc.borrow_mut();
+    let mut journal = journal_rc.as_ref().borrow_mut();
     let nblocks = handle.buffer_credits;
 
     if nblocks > journal.max_transaction_buffers {
@@ -535,7 +822,7 @@ pub(crate) fn start_handle(journal_rc: &Rc<RefCell<Journal>>, handle: &mut Handl
     }
 
     let transaction_rc = journal.running_transaction.as_ref().unwrap().clone();
-    let mut transaction = journal.running_transaction.as_ref().unwrap().borrow_mut();
+    let mut transaction = journal.running_transaction.as_ref().unwrap().as_ref().borrow_mut();
 
     if transaction.state == TransactionState::Locked {
         todo!("Wait for transaction to unlock.");

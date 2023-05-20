@@ -224,8 +224,9 @@ impl Transaction {
 impl Transaction {
     /// Add a buffer to a transaction's list of buffers. Please call it with list_lock held
     /// and make sure the generic buffer is unlocked.
-    fn file_buffer(
+    pub(crate) fn file_buffer(
         tx_rc: &Rc<RefCell<Transaction>>,
+        tx: &mut Transaction,
         jb_rc: &Rc<RefCell<JournalBuffer>>,
         jb: &mut JournalBuffer,
         list_type: BufferListType,
@@ -251,10 +252,12 @@ impl Transaction {
         };
 
         if let Some(jb_tx) = &jb.transaction {
-            Transaction::temp_unlink_buffer(&mut jb_tx.upgrade().unwrap().borrow_mut(), &jb_rc, jb);
+            if Rc::ptr_eq(&jb_tx.upgrade().unwrap(), &tx_rc) {
+                Transaction::temp_unlink_buffer(tx, &jb_rc, jb);
+            } else {
+                Transaction::temp_unlink_buffer(&mut jb_tx.upgrade().unwrap().borrow_mut(), &jb_rc, jb);
+            }
         }
-
-        let mut tx = tx_rc.borrow_mut();
 
         jb.transaction = Some(Rc::downgrade(tx_rc));
 
@@ -291,13 +294,9 @@ impl Transaction {
         }
     }
 
-    fn unfile_buffer(jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer) {
+    pub(crate) fn unfile_buffer(jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer, tx: &mut Transaction) {
         assert!(jb.transaction.is_some());
-        Self::temp_unlink_buffer(
-            &mut jb.transaction.as_ref().unwrap().upgrade().unwrap().borrow_mut(),
-            jb_rc,
-            jb,
-        );
+        Self::temp_unlink_buffer(tx, jb_rc, jb);
         jb.transaction = None;
     }
 
@@ -307,11 +306,10 @@ impl Transaction {
     /// buffer on that transaction's metadata list.
     ///
     /// Please call it with list_lock held and tx.lists unlocked.
-    pub(crate) fn refile_buffer(jb_rc: &Rc<RefCell<JournalBuffer>>) {
+    pub(crate) fn refile_buffer(jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer, tx: &mut Transaction) {
         // If the buffer is now unused, just drop it.
-        let mut jb = jb_rc.borrow_mut();
         if jb.next_transaction.is_none() {
-            Transaction::unfile_buffer(jb_rc, &mut jb);
+            Transaction::unfile_buffer(jb_rc, jb, tx);
             return;
         }
 
@@ -404,8 +402,10 @@ impl Handle {
         // TODO: async version
 
         journal.system.set_current_handle(None);
+        tx.outstanding_credits -= self.buffer_credits;
+        tx.updates -= 1;
 
-        todo!();
+        Ok(())
     }
 
     /// Restart a handle for a multi-transaction filesystem
@@ -452,7 +452,7 @@ impl Handle {
         // TODO: Lots of assertions here
 
         let tx_rc = &self.transaction.as_ref().unwrap();
-        let tx = tx_rc.borrow_mut();
+        let mut tx = tx_rc.borrow_mut();
         let journal_rc = tx.journal.upgrade().unwrap();
         let journal = &journal_rc.as_ref().borrow();
 
@@ -468,7 +468,7 @@ impl Handle {
                 buf.clear_dirty();
                 jb.modified = false;
 
-                Transaction::file_buffer(tx_rc, &jb_rc, &mut jb, BufferListType::Reserved)?;
+                Transaction::file_buffer(tx_rc, &mut tx, &jb_rc, &mut jb, BufferListType::Reserved)?;
                 false
             }
             Some(tx) => match &journal.committing_transaction {
@@ -544,6 +544,7 @@ impl Handle {
         let jb_rc = JournalBuffer::new_or_get(&buf);
         let mut jb = jb_rc.borrow_mut();
         let tx_rc = &self.transaction.as_ref().unwrap();
+        let mut tx = tx_rc.borrow_mut();
 
         // What if the buffer is already part of a running transaction?
         //
@@ -596,10 +597,10 @@ impl Handle {
 
             if jb.jlist != BufferListType::SyncData && jb.jlist != BufferListType::Locked {
                 // jb.jlist == BufferListType::None here
-                Transaction::file_buffer(&tx_rc, &jb_rc, &mut jb, BufferListType::SyncData)?;
+                Transaction::file_buffer(&tx_rc, &mut tx, &jb_rc, &mut jb, BufferListType::SyncData)?;
             }
         } else {
-            Transaction::file_buffer(&tx_rc, &jb_rc, &mut jb, BufferListType::SyncData)?;
+            Transaction::file_buffer(&tx_rc, &mut tx, &jb_rc, &mut jb, BufferListType::SyncData)?;
         }
 
         // no_journal:
@@ -626,6 +627,7 @@ impl Handle {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
         let tx_rc = &self.transaction.as_ref().unwrap();
+        let mut tx = tx_rc.borrow_mut();
 
         if !jb.modified {
             jb.modified = true;
@@ -638,7 +640,7 @@ impl Handle {
             return Ok(());
         }
 
-        Transaction::file_buffer(&tx_rc, &jb_rc, &mut jb, BufferListType::Metadata)?;
+        Transaction::file_buffer(&tx_rc, &mut tx, &jb_rc, &mut jb, BufferListType::Metadata)?;
 
         Ok(())
     }
@@ -686,7 +688,7 @@ impl Handle {
 
             if jb.cp_transaction.is_some() {
                 Transaction::temp_unlink_buffer(&mut tx, &jb_rc, &mut jb);
-                Transaction::file_buffer(&tx_rc, &jb_rc, &mut jb, BufferListType::Forget)?;
+                Transaction::file_buffer(&tx_rc, &mut tx, &jb_rc, &mut jb, BufferListType::Forget)?;
             } else {
                 todo!("unfile_buffer")
             }
@@ -709,7 +711,8 @@ impl Handle {
     }
 
     pub fn cancel_revoke(&self, jh: &Rc<RefCell<JournalBuffer>>) -> JBDResult {
-        todo!()
+        // TODO
+        Ok(())
     }
 }
 
@@ -822,7 +825,8 @@ impl Handle {
             // commits the new data
             if jb.transaction.is_none() {
                 jb.transaction = Some(Rc::downgrade(&this_tx));
-                Transaction::file_buffer(&this_tx, &jb_rc, jb, BufferListType::Reserved)?;
+                let mut this_tx_mut = this_tx.borrow_mut();
+                Transaction::file_buffer(&this_tx, &mut this_tx_mut, &jb_rc, jb, BufferListType::Reserved)?;
             }
         }
         // done:

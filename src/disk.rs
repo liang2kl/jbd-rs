@@ -59,7 +59,7 @@ pub struct Header {
 pub struct BlockTag {
     /// The on-disk block number
     pub block_nr: u32,
-    pub flag: TagFlag,
+    pub flag: u32,
 }
 
 /// The revoke descriptor: used on disk to describe a series of blocks to be revoked from the log
