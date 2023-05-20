@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod commit;
 mod config;
 mod disk;
 pub mod err;

@@ -2,7 +2,7 @@ mod common;
 
 use std::{borrow::Borrow, env, rc::Rc};
 
-use common::{create_handle, create_journal, mock, sal::dev::BLOCK_SIZE, JOURNAL_SIZE};
+use common::{create_handle, create_journal, mock, JOURNAL_SIZE};
 
 fn setup() {
     let _ = env_logger::builder().is_test(true).try_init();
