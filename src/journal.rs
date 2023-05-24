@@ -18,6 +18,9 @@ use crate::{
     tx::{BufferListType, Handle, JournalBuffer, Tid, Transaction, TransactionState},
 };
 
+#[cfg(feature = "debug")]
+use crate::disk::Display;
+
 pub struct Journal {
     pub system: Rc<dyn System>,
     pub sb_buffer: Rc<dyn Buffer>,
@@ -45,7 +48,7 @@ pub struct Journal {
     /// Sequence number of the most recent transaction wanting commit
     pub commit_request: Tid,
     /// List of all transactions waiting for checkpointing
-    pub checkpoint_transactions: LinkedList<Rc<RefCell<Transaction>>>,
+    pub checkpoint_transactions: Vec<Rc<RefCell<Transaction>>>,
     /// Block devices
     pub devs: JournalDevs,
     /// Total maximum capacity of the journal region on disk
@@ -143,7 +146,7 @@ impl Journal {
             transaction_sequence: 0,
             commit_sequence: 0,
             commit_request: 0,
-            checkpoint_transactions: LinkedList::new(),
+            checkpoint_transactions: Vec::new(),
             devs,
             maxlen: len,
             max_transaction_buffers: 0,
@@ -244,17 +247,6 @@ impl Journal {
     }
 }
 
-/// Checkpoint related interfaces.
-impl Journal {
-    pub fn do_checkpoint(&mut self) -> JBDResult {
-        todo!()
-    }
-
-    pub fn cleanup_tail(&mut self) -> JBDResult {
-        todo!()
-    }
-}
-
 /// Internal helper functions.
 impl Journal {
     /// Given a journal_t structure, initialize the various fields for
@@ -328,9 +320,12 @@ impl Journal {
         log::debug!("Updating superblock.");
         sb.sequence = (self.tail_sequence as u32).to_be();
         sb.start = self.tail.to_be();
-        sb.errno = self.errno;
+        sb.errno = self.errno.to_be();
 
         self.sb_buffer.sync();
+
+        #[cfg(feature = "debug")]
+        log::debug!("Superblock after update: {}", sb.display(0));
 
         if self.tail != 0 {
             self.flags.insert(JournalFlag::FLUSHED);
@@ -438,8 +433,6 @@ pub(crate) fn start_handle(journal_rc: &Rc<RefCell<Journal>>, handle: &mut Handl
         );
         return Err(JBDError::NotEnoughSpace);
     }
-
-    let system = &journal.system;
 
     log::debug!("New handle going live.");
 

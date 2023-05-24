@@ -15,6 +15,9 @@ use crate::{
     Journal,
 };
 
+#[cfg(feature = "debug")]
+use crate::disk::Display;
+
 /// Commit related interfaces.
 impl Journal {
     pub fn commit_transaction(&mut self) -> JBDResult {
@@ -97,13 +100,11 @@ impl Journal {
         let buffers = commit_tx.buffers.0.clone();
         let buffer_count = buffers.len();
 
-        let mut refile_buffers = Vec::new();
-
         for (i, jb_rc) in commit_tx.buffers.0.clone().into_iter().enumerate() {
             let mut jb = jb_rc.as_ref().borrow_mut();
             if self.flags.contains(JournalFlag::ABORT) {
                 jb.buf.clear_jbd_dirty();
-                refile_buffers.push(jb_rc.clone());
+                Transaction::refile_buffer(&jb_rc, &mut jb, &mut commit_tx);
                 continue;
             }
 
@@ -125,6 +126,9 @@ impl Journal {
                 first_tag = true;
                 descriptor_buf_data = Some(buf.buf_mut()[size_of::<Header>()..].as_mut_ptr());
                 space_left = buf.size() - size_of::<Header>();
+
+                #[cfg(feature = "debug")]
+                log::debug!("Added descriptor: {}", header.display(0));
             }
 
             // Where is the buffer to be written?
@@ -144,10 +148,14 @@ impl Journal {
                 tag_flag.insert(TagFlag::SAME_UUID);
             }
 
-            let tag_mut = unsafe { mem::transmute::<_, &mut BlockTag>(descriptor_buf_data.as_mut().unwrap()) };
+            let tag_ptr = descriptor_buf_data.unwrap();
+            let tag_mut = unsafe { mem::transmute::<_, &mut BlockTag>(tag_ptr) };
             tag_mut.block_nr = (jb.buf.block_id() as u32).to_be();
             tag_mut.flag = tag_flag.bits().to_be();
             space_left -= size_of::<BlockTag>();
+
+            #[cfg(feature = "debug")]
+            log::debug!("Added block: {}", tag_mut.display(0));
 
             unsafe {
                 *descriptor_buf_data.as_mut().unwrap() = descriptor_buf_data
@@ -173,6 +181,9 @@ impl Journal {
                 tag_flag.insert(TagFlag::LAST_TAG);
                 tag_mut.flag = tag_flag.bits().to_be();
 
+                #[cfg(feature = "debug")]
+                log::debug!("Modified for last tag: {}", tag_mut.display(0));
+
                 for buf in self.wbuf.iter() {
                     buf.mark_dirty();
                     buf.sync();
@@ -181,11 +192,6 @@ impl Journal {
 
                 descriptor_rc = None;
             }
-        }
-
-        for jb_rc in refile_buffers.into_iter() {
-            let mut jb = jb_rc.as_ref().borrow_mut();
-            Transaction::refile_buffer(&jb_rc, &mut jb, &mut commit_tx);
         }
 
         // We don't need to wait for the buffer to be written, as they are synced.
@@ -287,11 +293,11 @@ impl Journal {
 
         let new_jb_rc = JournalBuffer::new_or_get(&buf);
 
-        let (data, is_frozen) = if let Some(frozen_data) = &jb.frozen_data {
+        let data = if let Some(frozen_data) = &jb.frozen_data {
             done_copy_out = true;
-            (&frozen_data[..], true)
+            &frozen_data[..]
         } else {
-            (jb.buf.buf(), false)
+            jb.buf.buf()
         };
 
         // Check for escaping
@@ -305,19 +311,17 @@ impl Journal {
             new_data.resize(data.len(), 0);
             new_data.copy_from_slice(data);
 
-            if do_escape {
-                new_data[0] = 0;
-            }
-
             jb.frozen_data = Some(new_data);
             done_copy_out = true;
-        } else {
-            if is_frozen {
+        }
+
+        if do_escape {
+            if done_copy_out {
                 jb.frozen_data.as_mut().unwrap()[0] = 0;
             } else {
                 jb.buf.buf_mut()[0] = 0;
             }
-        };
+        }
 
         let mut new_jb = new_jb_rc.as_ref().borrow_mut();
         new_jb.transaction = None;
@@ -340,23 +344,14 @@ impl Journal {
             assert!(buf.jbd_managed());
 
             if buf.test_clear_dirty() {
-                self.wbuf.push(buf.clone());
+                buf.sync();
                 Transaction::file_buffer(tx_rc, tx, &jb_rc, &mut jb, BufferListType::Locked)?;
             } else {
                 Transaction::unfile_buffer(&jb_rc, &mut jb, tx);
             }
         }
 
-        self.do_submit_data();
-
         Ok(())
-    }
-
-    fn do_submit_data(&mut self) {
-        for buf in self.wbuf.iter() {
-            buf.sync();
-        }
-        self.wbuf.clear();
     }
 
     fn get_descriptor_buffer(&mut self) -> JBDResult<Rc<RefCell<JournalBuffer>>> {

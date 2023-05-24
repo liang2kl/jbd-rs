@@ -1,6 +1,9 @@
 //! On-disk structures for the journal.
 
+extern crate alloc;
+use alloc::string::{String, ToString};
 use bitflags::bitflags;
+use cfg_if::cfg_if;
 
 use crate::err::{JBDError, JBDResult};
 
@@ -112,4 +115,104 @@ pub struct Superblock {
     pub padding: [u32; 44],
     /// Ids of all fs'es sharing the log
     pub users: [u8; 16 * 48],
+}
+
+cfg_if! {
+if #[cfg(feature = "debug")] {
+
+pub trait Display {
+    fn display(&self, ident: usize) -> String;
+}
+
+fn get_ident(ident: usize) -> String {
+    let mut str = String::new();
+    str += "\n";
+    for _ in 0..ident {
+        str += "  ";
+    }
+    str
+}
+
+impl Display for BlockType {
+    fn display(&self, ident: usize) -> String {
+        match self {
+            BlockType::DescriptorBlock => "DescriptorBlock".to_string(),
+            BlockType::CommitBlock => "CommitBlock".to_string(),
+            BlockType::SuperblockV1 => "SuperblockV1".to_string(),
+            BlockType::SuperblockV2 => "SuperblockV2".to_string(),
+            BlockType::Revokeblock => "Revokeblock".to_string(),
+        }
+    }
+}
+
+impl Display for TagFlag {
+    fn display(&self, ident: usize) -> String {
+        get_ident(ident)
+            + &format_args!(
+                "ESCAPE: {}, SAME_UUID: {}, DELETED: {}, LAST_TAG: {}",
+                self.contains(TagFlag::ESCAPE),
+                self.contains(TagFlag::SAME_UUID),
+                self.contains(TagFlag::DELETED),
+                self.contains(TagFlag::LAST_TAG),
+            )
+            .to_string()
+    }
+}
+
+impl Display for Header {
+    fn display(&self, ident: usize) -> String {
+        let ident_str = get_ident(ident);
+        let block_type = BlockType::try_from(u32::from_be(self.block_type)).unwrap();
+        format_args!(
+            "{}magic: {:x}{}block_type: {}{}sequence: {}",
+            &ident_str,
+            u32::from_be(self.magic),
+            &ident_str,
+            block_type.display(ident + 1),
+            &ident_str,
+            u32::from_be(self.sequence),
+        )
+        .to_string()
+    }
+}
+
+impl Display for BlockTag {
+    fn display(&self, ident: usize) -> String {
+        let ident_str = get_ident(ident);
+        format_args!(
+            "{}block_nr: {}{}flag: {}",
+            &ident_str,
+            u32::from_be(self.block_nr),
+            &ident_str,
+            TagFlag::from_bits(u32::from_be(self.flag)).unwrap().display(ident + 1),
+        )
+        .to_string()
+    }
+}
+
+impl Display for Superblock {
+    fn display(&self, ident: usize) -> String {
+        let ident_str = get_ident(ident);
+        format_args!(
+            "{}header: {}{}block_size: {}{}maxlen: {}{}first: {}{}sequence: {}{}start: {}{}errno: {}",
+            &ident_str,
+            self.header.display(ident + 1),
+            &ident_str,
+            u32::from_be(self.block_size),
+            &ident_str,
+            u32::from_be(self.maxlen),
+            &ident_str,
+            u32::from_be(self.first),
+            &ident_str,
+            u32::from_be(self.sequence),
+            &ident_str,
+            u32::from_be(self.start),
+            &ident_str,
+            i32::from_be(self.errno),
+        )
+        .to_string()
+    }
+}
+
+}
 }

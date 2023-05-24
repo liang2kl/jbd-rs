@@ -2,11 +2,10 @@ mod common;
 
 use std::{borrow::Borrow, env, rc::Rc};
 
-use common::{create_handle, create_journal, mock, JOURNAL_SIZE};
+use common::{create_handle, create_journal, mock::write_random_block, mock::write_random_escape_block, JOURNAL_SIZE};
 
 fn setup() {
     let _ = env_logger::builder().is_test(true).try_init();
-    env::set_var("RUST_LOG", "debug");
 }
 
 #[test]
@@ -27,11 +26,18 @@ fn test_write_meta() {
     let mut handle = handle_rc.as_ref().borrow_mut();
     // Write a random block.
     let block_id = JOURNAL_SIZE;
-    let meta_buf = mock::write_random_block(&system, system.block_device().borrow(), block_id);
+    let meta_buf = write_random_block(&system, system.block_device().borrow(), block_id);
 
     // Write the block to the journal.
     handle.get_write_access(&meta_buf).unwrap();
     handle.dirty_metadata(&meta_buf).unwrap();
+
+    // Write a block that starts with the magic number.
+    let block_id = JOURNAL_SIZE + 1;
+    let meta_buf = write_random_escape_block(&system, system.block_device().borrow(), block_id);
+    handle.get_write_access(&meta_buf).unwrap();
+    handle.dirty_metadata(&meta_buf).unwrap();
+
     handle.stop().unwrap();
 
     journal.borrow_mut().commit_transaction().unwrap();
@@ -44,10 +50,14 @@ fn test_write_data() {
     let handle_rc = create_handle(journal.clone()).unwrap();
     let mut handle = handle_rc.as_ref().borrow_mut();
     let block_id = JOURNAL_SIZE;
-    let data_buf = mock::write_random_block(&system, system.block_device().borrow(), block_id);
+    let data_buf1 = write_random_block(&system, system.block_device().borrow(), block_id);
+    let data_buf2 = write_random_block(&system, system.block_device().borrow(), block_id + 1);
 
-    handle.get_write_access(&data_buf).unwrap();
-    handle.dirty_data(&data_buf).unwrap();
+    handle.get_write_access(&data_buf1).unwrap();
+    handle.get_write_access(&data_buf2).unwrap();
+    handle.dirty_data(&data_buf2).unwrap();
+    handle.dirty_data(&data_buf1).unwrap();
+
     handle.stop().unwrap();
 
     journal.borrow_mut().commit_transaction().unwrap();

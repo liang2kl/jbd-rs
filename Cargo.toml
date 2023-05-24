@@ -11,7 +11,6 @@ log_level_info = ["log/max_level_info"]
 log_level_debug = ["log/max_level_debug"]
 log_level_trace = ["log/max_level_trace"]
 debug = []
-default = []
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

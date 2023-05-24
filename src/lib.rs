@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod checkpoint;
 pub mod commit;
 mod config;
 mod disk;

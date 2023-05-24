@@ -113,7 +113,6 @@ impl Buffer for BlockCache {
         }
         drop(inner);
         self.clear_dirty();
-        log::debug!("sync block {}", self.block_id());
     }
 
     fn mark_jbd_dirty(&self) {
