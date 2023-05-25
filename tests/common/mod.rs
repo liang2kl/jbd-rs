@@ -20,3 +20,7 @@ pub fn create_journal() -> JBDResult<(Rc<UserSystem>, Rc<RefCell<Journal>>)> {
 pub fn create_handle(journal: Rc<RefCell<Journal>>) -> JBDResult<Rc<RefCell<Handle>>> {
     Journal::start(journal, 128)
 }
+
+pub fn setup_logger() {
+    let _ = env_logger::builder().is_test(true).try_init();
+}

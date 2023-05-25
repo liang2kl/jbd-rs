@@ -8,7 +8,7 @@ use std::{
     slice,
 };
 
-const BLOCK_CACHE_SIZE: usize = 16;
+const BLOCK_CACHE_SIZE: usize = 512;
 
 struct BlockCacheInner {
     device: Rc<dyn BlockDevice>,
@@ -113,6 +113,7 @@ impl Buffer for BlockCache {
         }
         drop(inner);
         self.clear_dirty();
+        log::trace!("Synced block {}", self.block_id());
     }
 
     fn mark_jbd_dirty(&self) {

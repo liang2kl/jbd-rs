@@ -403,7 +403,8 @@ impl Journal {
             let mut tx_mut = tx.as_ref().borrow_mut();
             tx_mut.state = TransactionState::Running;
             tx_mut.start_time = self.system.get_time();
-            tx_mut.tid = self.transaction_sequence;
+            // FIXME
+            tx_mut.tid = self.transaction_sequence + 1;
         }
         self.transaction_sequence += 1;
         // TODO: tx.expires

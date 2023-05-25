@@ -62,8 +62,7 @@ impl Journal {
         self.running_transaction = None;
         let commit_tx_rc = self.committing_transaction.as_mut().unwrap().clone();
         let mut commit_tx = commit_tx_rc.as_ref().borrow_mut();
-        let start_time = self.system.get_time();
-        commit_tx.log_start = start_time as u32;
+        commit_tx.log_start = self.head;
 
         log::debug!("Commit phase 2.");
 
@@ -199,19 +198,20 @@ impl Journal {
         log::debug!("Commit phase 4-5.");
 
         // IO bufs
-        let iobuf_len = commit_tx.iobuf_list.0.len();
-        for i in 0..iobuf_len {
-            let jb_rc = &commit_tx.iobuf_list.0[i].clone();
+        assert!(commit_tx.iobuf_list.0.len() == commit_tx.shadow_list.0.len());
+
+        while !commit_tx.iobuf_list.0.is_empty() {
+            let jb_rc = &commit_tx.iobuf_list.0[0].clone();
             let mut jb = jb_rc.as_ref().borrow_mut();
             Transaction::unfile_buffer(&jb_rc, &mut jb, &mut commit_tx);
-            let jb_rc = &commit_tx.shadow_list.0[i].clone();
+            let jb_rc = &commit_tx.shadow_list.0[0].clone();
             let mut jb = jb_rc.as_ref().borrow_mut();
             Transaction::unfile_buffer(&jb_rc, &mut jb, &mut commit_tx);
             Transaction::file_buffer(&commit_tx_rc, &mut commit_tx, jb_rc, &mut jb, BufferListType::Forget)?;
         }
 
-        commit_tx.iobuf_list.0.clear();
-        commit_tx.shadow_list.0.clear();
+        assert!(commit_tx.iobuf_list.0.is_empty());
+        assert!(commit_tx.shadow_list.0.is_empty());
 
         log::debug!("Commit phase 6.");
 
@@ -219,6 +219,10 @@ impl Journal {
         commit_tx.state = TransactionState::CommitRecord;
         self.write_commit_record(&mut commit_tx)?;
 
+        // Finally, we can do checkpoint
+        // processing: any buffers committed as a result of this
+        // transaction can be removed from any checkpoint list it was on
+        // before.
         log::debug!("Commit phase 7.");
 
         assert!(commit_tx.sync_datalist.0.is_empty());
@@ -229,21 +233,35 @@ impl Journal {
         assert!(commit_tx.log_list.0.is_empty());
 
         // TODO: Checkpoints
-        // let forget_list = commit_tx.forget.0.clone();
-        // commit_tx.forget.0.clear();
+        let forget_list = commit_tx.forget.0.clone();
 
-        // for jb_rc in forget_list {
-        //     let mut jb = jb_rc.as_ref().borrow_mut();
-        //     if jb.commited_data.is_some() {
-        //         jb.commited_data = None;
-        //         if jb.frozen_data.is_some() {
-        //             jb.commited_data = jb.frozen_data;
-        //             jb.frozen_data = None;
-        //         }
-        //     } else if jb.frozen_data.is_some() {
-        //         jb.frozen_data = None;
-        //     }
-        // }
+        for jb_rc in forget_list.into_iter() {
+            let mut jb = jb_rc.as_ref().borrow_mut();
+            if jb.commited_data.is_some() {
+                jb.commited_data = None;
+                if jb.frozen_data.is_some() {
+                    jb.commited_data = jb.frozen_data.clone();
+                    jb.frozen_data = None;
+                }
+            } else if jb.frozen_data.is_some() {
+                jb.frozen_data = None;
+            }
+
+            assert!(jb.cp_transaction.is_none());
+            assert!(jb.next_transaction.is_none());
+            let buf = &jb.buf;
+
+            if buf.jbd_dirty() {
+                jb.cp_transaction = Some(Rc::downgrade(&commit_tx_rc));
+                commit_tx.checkpoint_list.0.push(jb_rc.clone());
+            } else {
+                assert!(!buf.dirty());
+            }
+
+            Transaction::refile_buffer(&jb_rc, &mut jb, &mut commit_tx);
+        }
+
+        assert!(commit_tx.forget.0.is_empty());
 
         log::debug!("Commit phase 8.");
         commit_tx.state = TransactionState::Finished;
@@ -251,7 +269,9 @@ impl Journal {
         self.commit_sequence = commit_tx.tid;
         self.committing_transaction = None;
 
-        // TODO: Checkpoint
+        if !commit_tx.checkpoint_list.0.is_empty() {
+            self.checkpoint_transactions.push(commit_tx_rc.clone());
+        }
 
         log::debug!("Commit {} completed.", self.commit_sequence);
 

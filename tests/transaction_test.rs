@@ -2,15 +2,14 @@ mod common;
 
 use std::{borrow::Borrow, env, rc::Rc};
 
-use common::{create_handle, create_journal, mock::write_random_block, mock::write_random_escape_block, JOURNAL_SIZE};
-
-fn setup() {
-    let _ = env_logger::builder().is_test(true).try_init();
-}
+use common::{
+    create_handle, create_journal, mock::write_random_block, mock::write_random_escape_block, setup_logger,
+    JOURNAL_SIZE,
+};
 
 #[test]
 fn test_create_handle() {
-    setup();
+    setup_logger();
     let (_, journal) = create_journal().unwrap();
     let handle1 = create_handle(journal.clone()).unwrap();
     let handle2 = create_handle(journal.clone()).unwrap();
@@ -20,7 +19,7 @@ fn test_create_handle() {
 
 #[test]
 fn test_write_meta() {
-    setup();
+    setup_logger();
     let (system, journal) = create_journal().unwrap();
     let handle_rc = create_handle(journal.clone()).unwrap();
     let mut handle = handle_rc.as_ref().borrow_mut();
@@ -45,7 +44,7 @@ fn test_write_meta() {
 
 #[test]
 fn test_write_data() {
-    setup();
+    setup_logger();
     let (system, journal) = create_journal().unwrap();
     let handle_rc = create_handle(journal.clone()).unwrap();
     let mut handle = handle_rc.as_ref().borrow_mut();

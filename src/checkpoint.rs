@@ -3,35 +3,82 @@ use core::cell::RefCell;
 extern crate alloc;
 use alloc::rc::Rc;
 
-use crate::{err::JBDResult, tx::JournalBuffer, Journal};
+use crate::{
+    err::JBDResult,
+    journal::JournalFlag,
+    tx::{JournalBuffer, Transaction},
+    Journal,
+};
 
 impl Journal {
-    pub fn log_do_checkpoint(&mut self) -> JBDResult {
+    pub fn log_do_checkpoint(&mut self) -> bool {
         log::debug!("Start checkpoint.");
 
-        self.cleanup_tail()?;
+        let cleaned = self.cleanup_tail();
 
         // Start writing disk blocks
-        if self.checkpoint_transactions.is_empty() {
-            return Ok(());
+        if self.checkpoint_transactions.is_empty() || cleaned {
+            return false;
         }
 
         let tx_rc = self.checkpoint_transactions[0].clone();
         let mut tx = tx_rc.borrow_mut();
 
-        for jb_rc in tx.checkpoint_list.0.clone().into_iter() {
-            let mut jb = jb_rc.borrow_mut();
+        while !tx.checkpoint_list.0.is_empty() {
+            let jb_rc = tx.checkpoint_list.0[0].clone();
+            let jb = jb_rc.borrow();
+            tx.checkpoint_list.0.remove(0);
+            jb.buf.sync();
         }
 
-        Ok(())
+        self.checkpoint_transactions.remove(0);
+
+        true
     }
 
-    fn cleanup_tail(&mut self) -> JBDResult {
-        todo!()
-    }
+    fn cleanup_tail(&mut self) -> bool {
+        let (first_tid, blocknr) = if !self.checkpoint_transactions.is_empty() {
+            let tx_rc = &self.checkpoint_transactions[0];
+            let tx = tx_rc.borrow();
+            (tx.tid, tx.log_start)
+        } else if let Some(tx_rc) = &self.committing_transaction {
+            let tx = tx_rc.borrow();
+            (tx.tid, tx.log_start)
+        } else if let Some(tx_rc) = &self.running_transaction {
+            let tx = tx_rc.borrow();
+            (tx.tid, self.head)
+        } else {
+            (self.transaction_sequence, self.head)
+        };
 
-    // Try to flush one buffer from the checkpoint list to disk.
-    fn process_buffer(&mut self, jb_rc: Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer) -> JBDResult {
-        todo!()
+        assert!(blocknr != 0);
+
+        log::debug!(
+            "Cleanup tail: first_tid: {}, blocknr: {}, self.tail_sequence: {}",
+            first_tid,
+            blocknr,
+            self.tail_sequence
+        );
+
+        if self.tail_sequence == first_tid {
+            return true;
+        }
+
+        assert!(first_tid > self.tail_sequence);
+
+        let mut freed = blocknr - self.tail;
+        if blocknr < self.tail {
+            freed += self.last - self.first;
+        }
+
+        self.free += freed;
+        self.tail_sequence = first_tid;
+        self.tail = blocknr;
+
+        if !self.flags.contains(JournalFlag::ABORT) {
+            self.update_superblock();
+        }
+
+        false
     }
 }

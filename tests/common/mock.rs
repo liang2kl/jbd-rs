@@ -34,7 +34,7 @@ pub fn validate_block(system: &UserSystem, dev: &Rc<dyn BlockDevice>, block_id: 
     assert_eq!(convert_buf(&buf), convert_buf(&buf2));
 }
 
-fn convert_buf(buf: &Rc<dyn Buffer>) -> &mut [u8] {
+pub fn convert_buf(buf: &Rc<dyn Buffer>) -> &mut [u8] {
     let data = unsafe { slice::from_raw_parts_mut(buf.data(), buf.size()) };
     data
 }
