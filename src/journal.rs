@@ -1,21 +1,16 @@
 extern crate alloc;
 
-use core::{
-    borrow::{Borrow, BorrowMut},
-    cell::{Ref, RefCell},
-    mem::{self, size_of},
-    ptr,
-};
+use core::cell::RefCell;
 
-use alloc::{collections::LinkedList, rc::Rc, sync::Weak, vec::Vec};
+use alloc::{rc::Rc, vec::Vec};
 use bitflags::bitflags;
 
 use crate::{
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
-    disk::{BlockTag, BlockType, Header, Superblock, TagFlag},
+    disk::{BlockType, Superblock},
     err::{JBDError, JBDResult},
     sal::{BlockDevice, Buffer, System},
-    tx::{BufferListType, Handle, JournalBuffer, Tid, Transaction, TransactionState},
+    tx::{Handle, Tid, Transaction, TransactionState},
 };
 
 #[cfg(feature = "debug")]

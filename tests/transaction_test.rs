@@ -1,6 +1,6 @@
 mod common;
 
-use std::{borrow::Borrow, env, rc::Rc};
+use std::{borrow::Borrow, rc::Rc};
 
 use common::{
     create_handle, create_journal, mock::write_random_block, mock::write_random_escape_block, setup_logger,

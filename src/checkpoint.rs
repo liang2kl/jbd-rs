@@ -1,14 +1,4 @@
-use core::cell::RefCell;
-
-extern crate alloc;
-use alloc::rc::Rc;
-
-use crate::{
-    err::JBDResult,
-    journal::JournalFlag,
-    tx::{JournalBuffer, Transaction},
-    Journal,
-};
+use crate::{journal::JournalFlag, Journal};
 
 impl Journal {
     pub fn log_do_checkpoint(&mut self) -> bool {

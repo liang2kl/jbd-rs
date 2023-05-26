@@ -1,10 +1,7 @@
 mod common;
 use std::{borrow::Borrow, cell::RefCell, rc::Rc};
 
-use common::{
-    create_handle, create_journal, mock::write_random_block, mock::write_random_escape_block, sal::UserSystem,
-    setup_logger, JOURNAL_SIZE,
-};
+use common::{create_handle, create_journal, mock::write_random_block, sal::UserSystem, setup_logger, JOURNAL_SIZE};
 use jbd_rs::Journal;
 
 use crate::common::{mock::convert_buf, sal::dev::BLOCK_SIZE};

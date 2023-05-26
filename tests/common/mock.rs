@@ -29,11 +29,6 @@ pub fn write_random_escape_block(system: &UserSystem, dev: &Rc<dyn BlockDevice>,
     buf
 }
 
-pub fn validate_block(system: &UserSystem, dev: &Rc<dyn BlockDevice>, block_id: usize, buf: &Rc<dyn Buffer>) {
-    let buf2 = system.get_buffer_provider().get_buffer(dev, block_id).unwrap();
-    assert_eq!(convert_buf(&buf), convert_buf(&buf2));
-}
-
 pub fn convert_buf(buf: &Rc<dyn Buffer>) -> &mut [u8] {
     let data = unsafe { slice::from_raw_parts_mut(buf.data(), buf.size()) };
     data

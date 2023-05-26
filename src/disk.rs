@@ -1,6 +1,8 @@
 //! On-disk structures for the journal.
 
+#[cfg(feature = "debug")]
 extern crate alloc;
+#[cfg(feature = "debug")]
 use alloc::string::{String, ToString};
 use bitflags::bitflags;
 use cfg_if::cfg_if;

@@ -88,6 +88,11 @@ impl Buffer for BlockCache {
 
     fn set_jbd_managed(&self, managed: bool) {
         self.inner_mut().jbd_managed = managed;
+        log::trace!(
+            "Block {} is {}managed by jbd now",
+            self.block_id(),
+            if managed { "" } else { "not " }
+        );
     }
 
     fn jbd_managed(&self) -> bool {
@@ -96,10 +101,12 @@ impl Buffer for BlockCache {
 
     fn mark_dirty(&self) {
         self.inner_mut().dirty = true;
+        log::trace!("Marked block {} dirty", self.block_id());
     }
 
     fn clear_dirty(&self) {
         self.inner_mut().dirty = false;
+        log::trace!("Cleared block {} dirty", self.block_id());
     }
 
     fn sync(&self) {
@@ -118,10 +125,12 @@ impl Buffer for BlockCache {
 
     fn mark_jbd_dirty(&self) {
         self.inner_mut().jbd_dirty = true;
+        log::trace!("Marked block {} jbd dirty", self.block_id());
     }
 
     fn clear_jbd_dirty(&self) {
         self.inner_mut().jbd_dirty = false;
+        log::trace!("Cleared block {} jbd dirty", self.block_id());
     }
 
     fn jbd_dirty(&self) -> bool {

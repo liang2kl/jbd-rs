@@ -244,7 +244,7 @@ impl Transaction {
                 // tune2fs can modify the sb and set the dirty bit at any time
                 // so we try to gracefully handle that.
                 if jb.buf.dirty() {
-                    warn_dirty_buffer();
+                    log::warn!("Block {} is unexpectedly dirty", jb.buf.block_id());
                 }
                 jb.buf.test_clear_dirty() || jb.buf.test_clear_jbd_dirty()
             }
@@ -750,7 +750,7 @@ impl Handle {
             // First question: is this buffer already part of the current
             // transaction or the existing committing transaction?
             if jb.transaction.is_some() {
-                warn_dirty_buffer();
+                log::warn!("Block {} is unexpectedly dirty", jb.buf.block_id());
             }
             // In any case we need to clean the dirty flag.
             jb.buf.clear_dirty();
@@ -835,9 +835,4 @@ impl Handle {
 
         Ok(())
     }
-}
-
-#[inline]
-fn warn_dirty_buffer() {
-    log::warn!("Buffer is dirty");
 }
