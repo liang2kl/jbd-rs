@@ -7,6 +7,7 @@ pub enum JBDError {
     InvalidJournalSize,
     InvalidSuperblock,
     NotEnoughSpace,
+    JournalAborted,
     // Handle
     HandleAborted,
     TransactionNotRunning,

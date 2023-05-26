@@ -19,6 +19,8 @@ struct BlockCacheInner {
     private: Option<Box<dyn Any>>,
     jbd_managed: bool,
     jbd_dirty: bool,
+    revoked: bool,
+    revoke_valid: bool,
 }
 
 struct BlockCache {
@@ -42,6 +44,8 @@ impl BlockCache {
                 private: None,
                 jbd_managed: false,
                 jbd_dirty: false,
+                revoked: false,
+                revoke_valid: false,
             }),
         }
     }
@@ -146,6 +150,58 @@ impl Buffer for BlockCache {
     fn test_clear_jbd_dirty(&self) -> bool {
         let ret = self.inner().jbd_dirty;
         self.clear_jbd_dirty();
+        ret
+    }
+
+    fn revoked(&self) -> bool {
+        self.inner().revoked
+    }
+
+    fn set_revoked(&self) {
+        self.inner_mut().revoked = true;
+        log::trace!("Set block {} revoked", self.block_id());
+    }
+
+    fn clear_revoked(&self) {
+        self.inner_mut().revoked = false;
+        log::trace!("Cleared block {} revoked", self.block_id());
+    }
+
+    fn test_set_revoked(&self) -> bool {
+        let ret = self.inner().revoked;
+        self.set_revoked();
+        ret
+    }
+
+    fn test_clear_revoked(&self) -> bool {
+        let ret = self.inner().revoked;
+        self.clear_revoked();
+        ret
+    }
+
+    fn revoke_valid(&self) -> bool {
+        self.inner().revoke_valid
+    }
+
+    fn set_revoke_valid(&self) {
+        self.inner_mut().revoke_valid = true;
+        log::trace!("Set block {} revoke valid", self.block_id());
+    }
+
+    fn clear_revoke_valid(&self) {
+        self.inner_mut().revoke_valid = false;
+        log::trace!("Cleared block {} revoke valid", self.block_id());
+    }
+
+    fn test_set_revoke_valid(&self) -> bool {
+        let ret = self.inner().revoke_valid;
+        self.set_revoke_valid();
+        ret
+    }
+
+    fn test_clear_revoke_valid(&self) -> bool {
+        let ret = self.inner().revoke_valid;
+        self.clear_revoke_valid();
         ret
     }
 }

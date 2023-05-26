@@ -1,6 +1,15 @@
 use crate::{journal::JournalFlag, Journal};
 
 impl Journal {
+    pub fn do_all_checkpoints(&mut self) -> usize {
+        let mut count = 0;
+        while self.log_do_checkpoint() {
+            count += 1;
+        }
+
+        count
+    }
+
     pub fn log_do_checkpoint(&mut self) -> bool {
         log::debug!("Start checkpoint.");
 

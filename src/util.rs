@@ -4,10 +4,11 @@ macro_rules! jbd_assert {
     ($e:expr) => {
         assert!(
             $e,
-            "jbd-rs: unexpected error at {}:{}:{}",
+            "jbd-rs: assertion failed at {}:{}:{}: {}",
             file!(),
             line!(),
-            column!()
+            column!(),
+            stringify!($e),
         );
     };
 }

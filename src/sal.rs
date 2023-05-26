@@ -41,6 +41,16 @@ pub trait Buffer: Any {
     fn clear_jbd_dirty(&self);
     fn test_clear_jbd_dirty(&self) -> bool;
     fn jbd_dirty(&self) -> bool;
+    fn revoked(&self) -> bool;
+    fn set_revoked(&self);
+    fn test_set_revoked(&self) -> bool;
+    fn clear_revoked(&self);
+    fn test_clear_revoked(&self) -> bool;
+    fn revoke_valid(&self) -> bool;
+    fn set_revoke_valid(&self);
+    fn test_set_revoke_valid(&self) -> bool;
+    fn clear_revoke_valid(&self);
+    fn test_clear_revoke_valid(&self) -> bool;
 }
 
 impl dyn Buffer {

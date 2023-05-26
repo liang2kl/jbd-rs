@@ -2,13 +2,14 @@ extern crate alloc;
 
 use core::cell::RefCell;
 
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
 use bitflags::bitflags;
 
 use crate::{
     config::{JFS_MAGIC_NUMBER, JFS_MIN_JOURNAL_BLOCKS, MIN_LOG_RESERVED_BLOCKS},
     disk::{BlockType, Superblock},
     err::{JBDError, JBDResult},
+    revoke::RevokeRecord,
     sal::{BlockDevice, Buffer, System},
     tx::{Handle, Tid, Transaction, TransactionState},
 };
@@ -53,6 +54,8 @@ pub struct Journal {
     pub max_transaction_buffers: u32,
     // commit_interval: usize,
     pub wbuf: Vec<Rc<dyn Buffer>>,
+    pub(crate) revoke_tables: [BTreeMap<u32, RevokeRecord>; 2],
+    pub(crate) current_revoke_table: usize,
 }
 
 bitflags! {
@@ -100,8 +103,6 @@ pub struct JournalStates {
     pub commit_request: Tid,
 }
 
-struct RevokeTable;
-
 /// Public interfaces.
 impl Journal {
     /// Initialize an in-memory journal structure with a block device.
@@ -146,6 +147,8 @@ impl Journal {
             maxlen: len,
             max_transaction_buffers: 0,
             wbuf: Vec::new(),
+            revoke_tables: [BTreeMap::new(), BTreeMap::new()],
+            current_revoke_table: 0,
         };
 
         Ok(ret)
@@ -200,30 +203,6 @@ impl Journal {
         Ok(())
     }
 
-    // void journal_lock_updates () - establish a transaction barrier.
-    // @journal:  Journal to establish a barrier on.
-    //
-    // This locks out any further updates from being started, and blocks until all
-    // existing updates have completed, returning only once the journal is in a
-    // quiescent state with no updates running.
-    //
-    // We do not use simple mutex for synchronization as there are syscalls which
-    // want to return with filesystem locked and that trips up lockdep. Also
-    // hibernate needs to lock filesystem but locked mutex then blocks hibernation.
-    // Since locking filesystem is rare operation, we use simple counter and
-    // waitqueue for locking.
-    pub fn lock_updates(&mut self) {
-        todo!()
-    }
-
-    pub fn unlock_updates(&mut self) {
-        todo!()
-    }
-
-    pub fn force_commit(&mut self) {
-        todo!()
-    }
-
     pub fn start(journal_rc: Rc<RefCell<Journal>>, nblocks: u32) -> JBDResult<Rc<RefCell<Handle>>> {
         let journal = journal_rc.as_ref().borrow();
         if let Some(current_handle) = journal.system.get_current_handle() {
@@ -239,6 +218,28 @@ impl Journal {
             .system
             .set_current_handle(Some(handle.clone()));
         Ok(handle)
+    }
+
+    pub fn destroy(&mut self) -> JBDResult {
+        if self.running_transaction.is_some() {
+            self.commit_transaction()?;
+        }
+
+        self.do_all_checkpoints();
+
+        assert!(self.running_transaction.is_none());
+        assert!(self.committing_transaction.is_none());
+        assert!(self.checkpoint_transactions.is_empty());
+
+        if !self.flags.contains(JournalFlag::ABORT) {
+            self.tail = 0;
+            self.tail_sequence = self.transaction_sequence + 1;
+            self.update_superblock();
+        } else {
+            return Err(JBDError::JournalAborted);
+        }
+
+        Ok(())
     }
 }
 
@@ -368,15 +369,15 @@ impl Journal {
         Ok(())
     }
 
-    fn superblock_ref<'a>(&'a self) -> &'a Superblock {
+    pub(crate) fn superblock_ref<'a>(&'a self) -> &'a Superblock {
         self.sb_buffer.convert::<Superblock>()
     }
 
-    fn superblock_mut<'a>(&'a self) -> &'a mut Superblock {
+    pub(crate) fn superblock_mut<'a>(&'a self) -> &'a mut Superblock {
         self.sb_buffer.convert_mut::<Superblock>()
     }
 
-    pub(crate) fn get_buffer(&mut self, block_id: u32) -> JBDResult<Rc<dyn Buffer>> {
+    pub(crate) fn get_buffer(&self, block_id: u32) -> JBDResult<Rc<dyn Buffer>> {
         self.system
             .get_buffer_provider()
             .get_buffer(&self.devs.dev, (block_id + self.devs.blk_offset) as usize)

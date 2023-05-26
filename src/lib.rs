@@ -6,6 +6,8 @@ mod config;
 mod disk;
 pub mod err;
 pub mod journal;
+pub mod recovery;
+pub mod revoke;
 pub mod sal;
 mod tx;
 mod util;

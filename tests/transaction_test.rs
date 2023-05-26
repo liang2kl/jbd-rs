@@ -52,8 +52,6 @@ fn test_write_data() {
     let data_buf1 = write_random_block(&system, system.block_device().borrow(), block_id);
     let data_buf2 = write_random_block(&system, system.block_device().borrow(), block_id + 1);
 
-    handle.get_write_access(&data_buf1).unwrap();
-    handle.get_write_access(&data_buf2).unwrap();
     handle.dirty_data(&data_buf2).unwrap();
     handle.dirty_data(&data_buf1).unwrap();
 

@@ -482,9 +482,7 @@ impl Handle {
             jb.next_transaction = Some(Rc::downgrade(&tx_rc));
         }
 
-        drop(jb);
-
-        self.cancel_revoke(&jb_rc)?;
+        self.cancel_revoke(&jb_rc, &jb)?;
 
         Ok(())
     }
@@ -656,7 +654,7 @@ impl Handle {
     ///
     /// Allow this call even if the handle has aborted --- it may be part of
     /// the caller's cleanup after an abort.
-    fn forget(&mut self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub(crate) fn forget(&mut self, buf: &Rc<dyn Buffer>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
         let tx_rc = self.transaction.clone().unwrap();
@@ -707,11 +705,6 @@ impl Handle {
             self.buffer_credits -= 1;
         }
 
-        Ok(())
-    }
-
-    pub fn cancel_revoke(&self, jh: &Rc<RefCell<JournalBuffer>>) -> JBDResult {
-        // TODO
         Ok(())
     }
 }
@@ -830,8 +823,7 @@ impl Handle {
             }
         }
         // done:
-        drop(jb);
-        self.cancel_revoke(jb_rc)?;
+        self.cancel_revoke(jb_rc, jb)?;
 
         Ok(())
     }

@@ -22,10 +22,7 @@ fn test_checkpoint() {
     original_data.push(tx2_data);
     original_data.push(tx3_data);
 
-    assert!(journal.borrow_mut().log_do_checkpoint());
-    assert!(journal.borrow_mut().log_do_checkpoint());
-    assert!(journal.borrow_mut().log_do_checkpoint());
-    assert!(!journal.borrow_mut().log_do_checkpoint());
+    assert_eq!(journal.borrow_mut().do_all_checkpoints(), 3);
 
     // The data should have been written to the disk now.
     for i in 0..blocks_dist.len() {

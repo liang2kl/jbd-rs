@@ -29,7 +29,8 @@ impl Journal {
         assert!(self.running_transaction.is_some());
         assert!(self.committing_transaction.is_none());
 
-        let mut commit_tx = self.running_transaction.as_ref().unwrap().as_ref().borrow_mut();
+        let commit_tx_rc = self.running_transaction.as_ref().unwrap().clone();
+        let mut commit_tx = commit_tx_rc.as_ref().borrow_mut();
         assert!(commit_tx.state == TransactionState::Running);
 
         log::debug!("Start committing transaction {}.", commit_tx.tid);
@@ -52,8 +53,10 @@ impl Journal {
 
         log::debug!("Commit phase 1.");
 
-        // TODO: Clear revoked flag to reflect there is no revoked buffers
+        // Clear revoked flag to reflect there is no revoked buffers
         // in the next transaction which is going to be started.
+        self.clear_buffer_revoked_flags();
+        self.switch_revoke_table();
 
         commit_tx.state = TransactionState::Flush;
         drop(commit_tx);
@@ -81,6 +84,7 @@ impl Journal {
         }
 
         // TODO: write revoke records
+        self.write_revoke_records(&commit_tx);
 
         assert!(commit_tx.sync_datalist.0.is_empty());
 
