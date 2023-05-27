@@ -1,7 +1,7 @@
 //! The system abstraction layer.
 use core::{any::Any, cell::RefCell};
 extern crate alloc;
-use alloc::{boxed::Box, rc::Rc};
+use alloc::{boxed::Box, sync::Arc};
 
 use crate::tx::{Handle, JournalBuffer};
 
@@ -15,7 +15,7 @@ pub trait BlockDevice: Any {
 }
 
 pub trait Buffer: Any {
-    // fn device(&self) -> Rc<dyn BlockDevice>;
+    // fn device(&self) -> Arc<dyn BlockDevice>;
     fn block_id(&self) -> usize;
     fn size(&self) -> usize;
     fn dirty(&self) -> bool;
@@ -70,27 +70,27 @@ impl dyn Buffer {
         unsafe { &mut *(self.data() as *mut T) }
     }
 
-    pub(crate) fn journal_buffer(&self) -> Option<Rc<RefCell<JournalBuffer>>> {
+    pub(crate) fn journal_buffer(&self) -> Option<Arc<RefCell<JournalBuffer>>> {
         self.private()
             .as_deref()?
             .downcast_ref()
-            .map(|x: &Rc<RefCell<JournalBuffer>>| x.clone())
+            .map(|x: &Arc<RefCell<JournalBuffer>>| x.clone())
     }
 
-    pub(crate) fn set_journal_buffer(&self, jb: Rc<RefCell<JournalBuffer>>) {
+    pub(crate) fn set_journal_buffer(&self, jb: Arc<RefCell<JournalBuffer>>) {
         self.set_jbd_managed(true);
         self.set_private(Some(Box::new(jb)));
     }
 }
 
 pub trait BufferProvider: Any {
-    fn get_buffer(&self, dev: &Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>>;
-    fn sync(&self, dev: &Rc<dyn BlockDevice>, buf: Rc<dyn Buffer>);
+    fn get_buffer(&self, dev: &Arc<dyn BlockDevice>, block_id: usize) -> Option<Arc<dyn Buffer>>;
+    fn sync(&self, dev: &Arc<dyn BlockDevice>, buf: Arc<dyn Buffer>);
 }
 
 pub trait System: Any {
-    fn get_buffer_provider(&self) -> Rc<dyn BufferProvider>;
+    fn get_buffer_provider(&self) -> Arc<dyn BufferProvider>;
     fn get_time(&self) -> usize;
-    fn get_current_handle(&self) -> Option<Rc<RefCell<Handle>>>;
-    fn set_current_handle(&self, handle: Option<Rc<RefCell<Handle>>>);
+    fn get_current_handle(&self) -> Option<Arc<RefCell<Handle>>>;
+    fn set_current_handle(&self, handle: Option<Arc<RefCell<Handle>>>);
 }

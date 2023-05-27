@@ -1,6 +1,6 @@
 mod common;
 
-use std::{borrow::Borrow, rc::Rc};
+use std::{borrow::Borrow, sync::Arc};
 
 use common::{
     create_handle, create_journal, mock::write_random_block, mock::write_random_escape_block, setup_logger,
@@ -14,7 +14,7 @@ fn test_create_handle() {
     let handle1 = create_handle(journal.clone()).unwrap();
     let handle2 = create_handle(journal.clone()).unwrap();
     // Each process has a singleton handle.
-    assert!(Rc::ptr_eq(&handle1, &handle2));
+    assert!(Arc::ptr_eq(&handle1, &handle2));
 }
 
 #[test]

@@ -1,5 +1,5 @@
 mod common;
-use std::{borrow::Borrow, cell::RefCell, rc::Rc};
+use std::{borrow::Borrow, cell::RefCell, sync::Arc};
 
 use common::{create_handle, create_journal, mock::write_random_block, sal::UserSystem, setup_logger, JOURNAL_SIZE};
 use jbd_rs::Journal;
@@ -36,7 +36,7 @@ fn test_checkpoint() {
     }
 }
 
-fn do_one_transaction(system: &Rc<UserSystem>, journal: Rc<RefCell<Journal>>, blocks: Vec<usize>) -> Vec<Vec<u8>> {
+fn do_one_transaction(system: &Arc<UserSystem>, journal: Arc<RefCell<Journal>>, blocks: Vec<usize>) -> Vec<Vec<u8>> {
     let handle_rc = create_handle(journal.clone()).unwrap();
     let mut handle = handle_rc.as_ref().borrow_mut();
 

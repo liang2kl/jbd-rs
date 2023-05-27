@@ -4,7 +4,7 @@ use core::{
 };
 
 extern crate alloc;
-use alloc::{rc::Rc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use crate::{
     config::JFS_MAGIC_NUMBER,
@@ -94,7 +94,7 @@ impl Journal {
 
         assert!(commit_tx.nr_buffers <= commit_tx.outstanding_credits as i32);
 
-        let mut descriptor_rc: Option<Rc<RefCell<JournalBuffer>>> = None;
+        let mut descriptor_rc: Option<Arc<RefCell<JournalBuffer>>> = None;
         let mut first_tag = false;
         let mut descriptor_buf_data: Option<*mut u8> = None;
         let mut space_left = 0;
@@ -256,7 +256,7 @@ impl Journal {
             let buf = &jb.buf;
 
             if buf.jbd_dirty() {
-                jb.cp_transaction = Some(Rc::downgrade(&commit_tx_rc));
+                jb.cp_transaction = Some(Arc::downgrade(&commit_tx_rc));
                 commit_tx.checkpoint_list.0.push(jb_rc.clone());
             } else {
                 assert!(!buf.dirty());
@@ -303,12 +303,12 @@ impl Journal {
 
     fn write_metadata_buffer(
         &mut self,
-        tx_rc: &Rc<RefCell<Transaction>>,
+        tx_rc: &Arc<RefCell<Transaction>>,
         tx: &mut Transaction,
-        jb_rc: &Rc<RefCell<JournalBuffer>>,
+        jb_rc: &Arc<RefCell<JournalBuffer>>,
         jb: &mut JournalBuffer,
         blocknr: u32,
-    ) -> JBDResult<(Rc<RefCell<JournalBuffer>>, bool, bool)> {
+    ) -> JBDResult<(Arc<RefCell<JournalBuffer>>, bool, bool)> {
         let mut need_copy_out = false;
         let mut done_copy_out = false;
         let mut do_escape = false;
@@ -357,7 +357,7 @@ impl Journal {
         Ok((new_jb_rc.clone(), do_escape, done_copy_out))
     }
 
-    fn submit_data_buffers(&mut self, tx_rc: &Rc<RefCell<Transaction>>, tx: &mut Transaction) -> JBDResult {
+    fn submit_data_buffers(&mut self, tx_rc: &Arc<RefCell<Transaction>>, tx: &mut Transaction) -> JBDResult {
         let datalist = tx.sync_datalist.0.clone();
         tx.sync_datalist.0.clear();
 
@@ -378,7 +378,7 @@ impl Journal {
         Ok(())
     }
 
-    fn get_descriptor_buffer(&mut self) -> JBDResult<Rc<RefCell<JournalBuffer>>> {
+    fn get_descriptor_buffer(&mut self) -> JBDResult<Arc<RefCell<JournalBuffer>>> {
         let blocknr = self.next_log_block();
         let buf = self.get_buffer(blocknr)?;
         buf.buf_mut().fill(0);

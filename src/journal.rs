@@ -2,7 +2,7 @@ extern crate alloc;
 
 use core::cell::RefCell;
 
-use alloc::{collections::BTreeMap, rc::Rc, vec::Vec};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use bitflags::bitflags;
 
 use crate::{
@@ -18,13 +18,13 @@ use crate::{
 use crate::disk::Display;
 
 pub struct Journal {
-    pub system: Rc<dyn System>,
-    pub sb_buffer: Rc<dyn Buffer>,
+    pub system: Arc<dyn System>,
+    pub sb_buffer: Arc<dyn Buffer>,
     pub format_version: i32,
     pub flags: JournalFlag,
     pub errno: i32, // TODO: Strongly-typed error?
-    pub running_transaction: Option<Rc<RefCell<Transaction>>>,
-    pub committing_transaction: Option<Rc<RefCell<Transaction>>>,
+    pub running_transaction: Option<Arc<RefCell<Transaction>>>,
+    pub committing_transaction: Option<Arc<RefCell<Transaction>>>,
     /// Journal head: identifies the first unused block in the journal.
     pub head: u32,
     /// Journal tail: identifies the oldest still-used block in the journal
@@ -44,7 +44,7 @@ pub struct Journal {
     /// Sequence number of the most recent transaction wanting commit
     pub commit_request: Tid,
     /// List of all transactions waiting for checkpointing
-    pub checkpoint_transactions: Vec<Rc<RefCell<Transaction>>>,
+    pub checkpoint_transactions: Vec<Arc<RefCell<Transaction>>>,
     /// Block devices
     pub(crate) devs: JournalDevs,
     /// Total maximum capacity of the journal region on disk
@@ -53,7 +53,7 @@ pub struct Journal {
     /// commit transaction
     pub max_transaction_buffers: u32,
     // commit_interval: usize,
-    pub wbuf: Vec<Rc<dyn Buffer>>,
+    pub wbuf: Vec<Arc<dyn Buffer>>,
     pub(crate) revoke_tables: [BTreeMap<u32, RevokeRecord>; 2],
     pub(crate) current_revoke_table: usize,
 }
@@ -71,17 +71,17 @@ bitflags! {
 }
 
 pub(crate) struct JournalDevs {
-    pub(crate) dev: Rc<dyn BlockDevice>,
+    pub(crate) dev: Arc<dyn BlockDevice>,
     pub(crate) blk_offset: u32,
-    pub(crate) fs_dev: Rc<dyn BlockDevice>,
+    pub(crate) fs_dev: Arc<dyn BlockDevice>,
 }
 
 /// Journal states protected by a single spin lock in Linux.
 pub struct JournalStates {
     pub flags: JournalFlag,
     pub errno: i32, // TODO: Strongly-typed error?
-    pub running_transaction: Option<Rc<Transaction>>,
-    pub committing_transaction: Option<Rc<Transaction>>,
+    pub running_transaction: Option<Arc<Transaction>>,
+    pub committing_transaction: Option<Arc<Transaction>>,
     /// Journal head: identifies the first unused block in the journal.
     pub head: u32,
     /// Journal tail: identifies the oldest still-used block in the journal
@@ -107,9 +107,9 @@ pub struct JournalStates {
 impl Journal {
     /// Initialize an in-memory journal structure with a block device.
     pub fn init_dev(
-        system: Rc<dyn System>,
-        dev: Rc<dyn BlockDevice>,
-        fs_dev: Rc<dyn BlockDevice>,
+        system: Arc<dyn System>,
+        dev: Arc<dyn BlockDevice>,
+        fs_dev: Arc<dyn BlockDevice>,
         start: u32,
         len: u32,
     ) -> JBDResult<Self> {
@@ -203,7 +203,7 @@ impl Journal {
         Ok(())
     }
 
-    pub fn start(journal_rc: Rc<RefCell<Journal>>, nblocks: u32) -> JBDResult<Rc<RefCell<Handle>>> {
+    pub fn start(journal_rc: Arc<RefCell<Journal>>, nblocks: u32) -> JBDResult<Arc<RefCell<Handle>>> {
         let journal = journal_rc.as_ref().borrow();
         if let Some(current_handle) = journal.system.get_current_handle() {
             return Ok(current_handle.clone());
@@ -211,7 +211,7 @@ impl Journal {
         let mut handle = Handle::new(nblocks);
         drop(journal);
         start_handle(&journal_rc, &mut handle)?;
-        let handle = Rc::new(RefCell::new(handle));
+        let handle = Arc::new(RefCell::new(handle));
         journal_rc
             .as_ref()
             .borrow()
@@ -377,20 +377,20 @@ impl Journal {
         self.sb_buffer.convert_mut::<Superblock>()
     }
 
-    pub(crate) fn get_buffer(&self, block_id: u32) -> JBDResult<Rc<dyn Buffer>> {
+    pub(crate) fn get_buffer(&self, block_id: u32) -> JBDResult<Arc<dyn Buffer>> {
         self.system
             .get_buffer_provider()
             .get_buffer(&self.devs.dev, (block_id + self.devs.blk_offset) as usize)
             .map_or(Err(JBDError::IOError), |bh| Ok(bh))
     }
 
-    pub(crate) fn sync_buffer(&self, buffer: Rc<dyn Buffer>) {
+    pub(crate) fn sync_buffer(&self, buffer: Arc<dyn Buffer>) {
         self.system.get_buffer_provider().sync(&self.devs.dev, buffer);
     }
 
     /// Start a new transaction in the journal, equivalent to get_transaction()
     /// in linux.
-    fn set_transaction(&mut self, tx: &Rc<RefCell<Transaction>>) {
+    fn set_transaction(&mut self, tx: &Arc<RefCell<Transaction>>) {
         {
             let mut tx_mut = tx.as_ref().borrow_mut();
             tx_mut.state = TransactionState::Running;
@@ -414,7 +414,7 @@ impl Journal {
     }
 }
 
-pub(crate) fn start_handle(journal_rc: &Rc<RefCell<Journal>>, handle: &mut Handle) -> JBDResult {
+pub(crate) fn start_handle(journal_rc: &Arc<RefCell<Journal>>, handle: &mut Handle) -> JBDResult {
     let mut journal = journal_rc.as_ref().borrow_mut();
     let nblocks = handle.buffer_credits;
 
@@ -437,8 +437,8 @@ pub(crate) fn start_handle(journal_rc: &Rc<RefCell<Journal>>, handle: &mut Handl
     }
 
     if journal.running_transaction.is_none() {
-        let tx = Transaction::new(Rc::downgrade(journal_rc));
-        let tx = Rc::new(RefCell::new(tx));
+        let tx = Transaction::new(Arc::downgrade(journal_rc));
+        let tx = Arc::new(RefCell::new(tx));
         journal.set_transaction(&tx);
     }
 

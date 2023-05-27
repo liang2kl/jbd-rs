@@ -1,7 +1,7 @@
 use core::{borrow::BorrowMut, cell::RefCell};
 
 extern crate alloc;
-use alloc::{collections::BTreeMap, rc::Rc};
+use alloc::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     err::{JBDError, JBDResult},
@@ -16,7 +16,7 @@ pub(crate) struct RevokeRecord {
 }
 
 impl Handle {
-    pub fn revoke(&mut self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub fn revoke(&mut self, buf: &Arc<dyn Buffer>) -> JBDResult {
         let transcation_rc = self.transaction.as_ref().unwrap().clone();
         let mut transaction = transcation_rc.as_ref().borrow_mut();
         let journal_rc = transaction.journal.upgrade().unwrap();
@@ -39,7 +39,7 @@ impl Handle {
         Ok(())
     }
 
-    pub(crate) fn cancel_revoke(&self, jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &JournalBuffer) -> JBDResult {
+    pub(crate) fn cancel_revoke(&self, jb_rc: &Arc<RefCell<JournalBuffer>>, jb: &JournalBuffer) -> JBDResult {
         let buf = &jb.buf;
         let transaction_rc = jb.transaction.as_ref().unwrap().upgrade().unwrap();
         let transaction = transaction_rc.borrow();
@@ -89,7 +89,7 @@ impl Journal {
 
     pub(crate) fn write_revoke_records(&mut self, transaction: &Transaction) {
         let mut revoke_table = &mut self.revoke_tables[(self.current_revoke_table + 1) % 2];
-        let mut descriptor_rc: Option<Rc<RefCell<JournalBuffer>>> = None;
+        let mut descriptor_rc: Option<Arc<RefCell<JournalBuffer>>> = None;
     }
 
     pub(crate) fn clear_buffer_revoked_flags(&mut self) {

@@ -8,7 +8,7 @@ use crate::{
     journal::{start_handle, Journal},
     sal::Buffer,
 };
-use alloc::{rc::Rc, rc::Weak, vec::Vec};
+use alloc::{sync::Arc, sync::Weak, vec::Vec};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BufferListType {
@@ -25,7 +25,7 @@ pub(crate) enum BufferListType {
 
 /// Journal-internal buffer management unit, equivalent to journal_head in Linux.
 pub struct JournalBuffer {
-    pub(crate) buf: Rc<dyn Buffer>,
+    pub(crate) buf: Arc<dyn Buffer>,
     /// Pointer to the compound transaction which owns this buffer's
     /// metadata: either the running transaction or the committing
     /// transaction (if there is one).  Only applies to buffers on a
@@ -55,11 +55,11 @@ pub struct JournalBuffer {
 }
 
 impl JournalBuffer {
-    pub fn new_or_get(buf: &Rc<dyn Buffer>) -> Rc<RefCell<Self>> {
+    pub fn new_or_get(buf: &Arc<dyn Buffer>) -> Arc<RefCell<Self>> {
         match buf.journal_buffer() {
             Some(jb) => jb.clone(),
             None => {
-                let ret = Rc::new(RefCell::new(Self {
+                let ret = Arc::new(RefCell::new(Self {
                     buf: buf.clone(),
                     transaction: None,
                     next_transaction: None,
@@ -75,9 +75,9 @@ impl JournalBuffer {
         }
     }
 
-    fn tx_eq(&self, tx: &Rc<RefCell<Transaction>>) -> bool {
+    fn tx_eq(&self, tx: &Arc<RefCell<Transaction>>) -> bool {
         match &self.transaction {
-            Some(t) => t.upgrade().map_or(false, |x| Rc::ptr_eq(&x, tx)),
+            Some(t) => t.upgrade().map_or(false, |x| Arc::ptr_eq(&x, tx)),
             None => false,
         }
     }
@@ -150,16 +150,16 @@ pub struct Transaction {
                            // pub synchronous_commit: bool,
 }
 
-pub struct JournalBufferList(pub Vec<Rc<RefCell<JournalBuffer>>>);
+pub struct JournalBufferList(pub Vec<Arc<RefCell<JournalBuffer>>>);
 
 impl JournalBufferList {
     fn new() -> Self {
         Self(Vec::new())
     }
-    fn remove(&mut self, jb: &Rc<RefCell<JournalBuffer>>) {
-        self.0.retain(|x| !Rc::ptr_eq(x, jb));
+    fn remove(&mut self, jb: &Arc<RefCell<JournalBuffer>>) {
+        self.0.retain(|x| !Arc::ptr_eq(x, jb));
     }
-    fn insert(&mut self, jb: Rc<RefCell<JournalBuffer>>) {
+    fn insert(&mut self, jb: Arc<RefCell<JournalBuffer>>) {
         self.0.push(jb);
     }
 }
@@ -192,7 +192,7 @@ impl Transaction {
 }
 
 impl Transaction {
-    fn remove_buffer(&mut self, jb: &Rc<RefCell<JournalBuffer>>, list_type: BufferListType) {
+    fn remove_buffer(&mut self, jb: &Arc<RefCell<JournalBuffer>>, list_type: BufferListType) {
         // FIXME: Linux has lots of asserts here
         match list_type {
             BufferListType::None => {}
@@ -206,7 +206,7 @@ impl Transaction {
             BufferListType::Locked => self.locked_list.remove(jb),
         };
     }
-    fn insert_buffer(&mut self, jb: Rc<RefCell<JournalBuffer>>, list_type: BufferListType) {
+    fn insert_buffer(&mut self, jb: Arc<RefCell<JournalBuffer>>, list_type: BufferListType) {
         match list_type {
             BufferListType::None => {}
             BufferListType::SyncData => self.sync_datalist.insert(jb),
@@ -225,9 +225,9 @@ impl Transaction {
     /// Add a buffer to a transaction's list of buffers. Please call it with list_lock held
     /// and make sure the generic buffer is unlocked.
     pub(crate) fn file_buffer(
-        tx_rc: &Rc<RefCell<Transaction>>,
+        tx_rc: &Arc<RefCell<Transaction>>,
         tx: &mut Transaction,
-        jb_rc: &Rc<RefCell<JournalBuffer>>,
+        jb_rc: &Arc<RefCell<JournalBuffer>>,
         jb: &mut JournalBuffer,
         list_type: BufferListType,
     ) -> JBDResult {
@@ -252,14 +252,14 @@ impl Transaction {
         };
 
         if let Some(jb_tx) = &jb.transaction {
-            if Rc::ptr_eq(&jb_tx.upgrade().unwrap(), &tx_rc) {
+            if Arc::ptr_eq(&jb_tx.upgrade().unwrap(), &tx_rc) {
                 Transaction::temp_unlink_buffer(tx, &jb_rc, jb);
             } else {
                 Transaction::temp_unlink_buffer(&mut jb_tx.upgrade().unwrap().borrow_mut(), &jb_rc, jb);
             }
         }
 
-        jb.transaction = Some(Rc::downgrade(tx_rc));
+        jb.transaction = Some(Arc::downgrade(tx_rc));
 
         tx.insert_buffer(jb_rc.clone(), list_type);
 
@@ -280,7 +280,7 @@ impl Transaction {
 
     /// Remove a buffer from the appropriate transaction list.
     /// Call under j_list_lock and unlocked tx.lists.
-    fn temp_unlink_buffer(tx: &mut Transaction, jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer) {
+    fn temp_unlink_buffer(tx: &mut Transaction, jb_rc: &Arc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer) {
         let buf = &jb.buf;
         if jb.jlist == BufferListType::Metadata {
             tx.nr_buffers -= 1;
@@ -294,7 +294,7 @@ impl Transaction {
         }
     }
 
-    pub(crate) fn unfile_buffer(jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer, tx: &mut Transaction) {
+    pub(crate) fn unfile_buffer(jb_rc: &Arc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer, tx: &mut Transaction) {
         assert!(jb.transaction.is_some());
         Self::temp_unlink_buffer(tx, jb_rc, jb);
         jb.transaction = None;
@@ -306,7 +306,7 @@ impl Transaction {
     /// buffer on that transaction's metadata list.
     ///
     /// Please call it with list_lock held and tx.lists unlocked.
-    pub(crate) fn refile_buffer(jb_rc: &Rc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer, tx: &mut Transaction) {
+    pub(crate) fn refile_buffer(jb_rc: &Arc<RefCell<JournalBuffer>>, jb: &mut JournalBuffer, tx: &mut Transaction) {
         // If the buffer is now unused, just drop it.
         if jb.next_transaction.is_none() {
             Transaction::unfile_buffer(jb_rc, jb, tx);
@@ -328,7 +328,7 @@ impl Transaction {
 /// Represents a single atomic update being performed by some process.
 pub struct Handle {
     /// Which compound transaction is this update a part of?
-    pub transaction: Option<Rc<RefCell<Transaction>>>,
+    pub transaction: Option<Arc<RefCell<Transaction>>>,
     /// Number of remaining buffers we are allowed to dirty
     pub buffer_credits: u32,
     pub err: i32, // TODO
@@ -441,7 +441,7 @@ impl Handle {
 impl Handle {
     /// Notify intent to use newly created buffer. Call this if you create a new buffer.
     /// The buffer must not be locked.
-    pub fn get_create_access(&self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub fn get_create_access(&self, buf: &Arc<dyn Buffer>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
 
@@ -473,13 +473,13 @@ impl Handle {
             }
             Some(tx) => match &journal.committing_transaction {
                 None => false,
-                Some(committing_tx) => Rc::ptr_eq(&tx.upgrade().unwrap(), &committing_tx),
+                Some(committing_tx) => Arc::ptr_eq(&tx.upgrade().unwrap(), &committing_tx),
             },
         };
 
         if should_set_next_tx {
             jb.modified = false;
-            jb.next_transaction = Some(Rc::downgrade(&tx_rc));
+            jb.next_transaction = Some(Arc::downgrade(&tx_rc));
         }
 
         self.cancel_revoke(&jb_rc, &jb)?;
@@ -488,7 +488,7 @@ impl Handle {
     }
 
     /// Notify intent to modify a buffer for metadata (not data) update.
-    pub fn get_write_access(&self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub fn get_write_access(&self, buf: &Arc<dyn Buffer>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
         // Make sure that the buffer completes any outstanding IO before proceeding
@@ -513,7 +513,7 @@ impl Handle {
     /// of, buffers touched here are guaranteed to be dirtied later and so
     /// will be committed to a new transaction in due course, at which point
     /// we can discard the old committed data pointer.
-    pub fn get_undo_access(&self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub fn get_undo_access(&self, buf: &Arc<dyn Buffer>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
 
@@ -534,7 +534,7 @@ impl Handle {
     ///
     /// The buffer is placed on the transaction's data list and is marked as
     /// belonging to the transaction.
-    pub fn dirty_data(&mut self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub fn dirty_data(&mut self, buf: &Arc<dyn Buffer>) -> JBDResult {
         if self.aborted {
             return Err(JBDError::HandleAborted);
         }
@@ -570,7 +570,7 @@ impl Handle {
 
         if let Some(jb_tx) = &jb.transaction {
             let jb_tx = jb_tx.upgrade().unwrap();
-            if !Rc::ptr_eq(&jb_tx, &tx_rc) {
+            if !Arc::ptr_eq(&jb_tx, &tx_rc) {
                 // The buffer belongs to a different transaction.
                 if jb.jlist != BufferListType::None
                     && jb.jlist != BufferListType::SyncData
@@ -589,10 +589,10 @@ impl Handle {
                 // TODO: if (unlikely(!buffer_uptodate(bh)))
                 if let Some(jb_tx) = &jb.transaction {
                     let jb_tx = jb_tx.upgrade().unwrap();
-                    if !Rc::ptr_eq(&jb_tx, &tx_rc) {
+                    if !Arc::ptr_eq(&jb_tx, &tx_rc) {
                         // Unlink buffer from old transaction
                         Transaction::temp_unlink_buffer(&mut jb_tx.borrow_mut(), &jb_rc, &mut jb);
-                        jb.transaction = Some(Rc::downgrade(&tx_rc));
+                        jb.transaction = Some(Arc::downgrade(&tx_rc));
                     }
                 }
             }
@@ -621,7 +621,7 @@ impl Handle {
     /// data present for that commit).  In that case, we don't relink the
     /// buffer: that only gets done when the old transaction finally
     /// completes its commit.
-    pub fn dirty_metadata(&mut self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub fn dirty_metadata(&mut self, buf: &Arc<dyn Buffer>) -> JBDResult {
         if self.aborted {
             return Err(JBDError::HandleAborted);
         }
@@ -658,7 +658,7 @@ impl Handle {
     ///
     /// Allow this call even if the handle has aborted --- it may be part of
     /// the caller's cleanup after an abort.
-    pub(crate) fn forget(&mut self, buf: &Rc<dyn Buffer>) -> JBDResult {
+    pub(crate) fn forget(&mut self, buf: &Arc<dyn Buffer>) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
         let tx_rc = self.transaction.clone().unwrap();
@@ -723,7 +723,7 @@ impl Handle {
     /// part of the transaction, that is).
     fn do_get_write_access(
         &self,
-        jb_rc: &Rc<RefCell<JournalBuffer>>,
+        jb_rc: &Arc<RefCell<JournalBuffer>>,
         jb: &mut JournalBuffer,
         force_copy: bool,
     ) -> JBDResult {
@@ -765,7 +765,7 @@ impl Handle {
             // The buffer is already part of this transaction if b_transaction or
             // b_next_transaction points to it
             if let Some(tx) = &jb.transaction {
-                if tx.upgrade().map_or(false, |tx| Rc::ptr_eq(&tx, &this_tx)) {
+                if tx.upgrade().map_or(false, |tx| Arc::ptr_eq(&tx, &this_tx)) {
                     break;
                 }
             }
@@ -775,13 +775,13 @@ impl Handle {
             // If there is already a copy-out version of this buffer, then we don't
             // need to make another one
             if jb.frozen_data.is_some() {
-                jb.next_transaction = Some(Rc::downgrade(&this_tx));
+                jb.next_transaction = Some(Arc::downgrade(&this_tx));
                 break;
             }
 
             // Is there data here we need to preserve?
             if let Some(tx) = &jb.transaction {
-                if !Rc::ptr_eq(&tx.upgrade().unwrap(), &this_tx) {
+                if !Arc::ptr_eq(&tx.upgrade().unwrap(), &this_tx) {
                     // There is one case we have to be very careful about.
                     // If the committing transaction is currently writing
                     // this buffer out to disk and has NOT made a copy-out,
@@ -813,7 +813,7 @@ impl Handle {
                         frozen_data.clone_from_slice(jb.buf.buf());
                         jb.frozen_data = Some(frozen_data);
                     }
-                    jb.next_transaction = Some(Rc::downgrade(&this_tx));
+                    jb.next_transaction = Some(Arc::downgrade(&this_tx));
                 }
             }
 
@@ -821,7 +821,7 @@ impl Handle {
             // sure it doesn't get written to disk before the caller actually
             // commits the new data
             if jb.transaction.is_none() {
-                jb.transaction = Some(Rc::downgrade(&this_tx));
+                jb.transaction = Some(Arc::downgrade(&this_tx));
                 let mut this_tx_mut = this_tx.borrow_mut();
                 Transaction::file_buffer(&this_tx, &mut this_tx_mut, &jb_rc, jb, BufferListType::Reserved)?;
             }

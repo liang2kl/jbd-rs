@@ -4,14 +4,14 @@ use std::{
     any::Any,
     cell::{Ref, RefCell, RefMut},
     collections::VecDeque,
-    rc::Rc,
     slice,
+    sync::Arc,
 };
 
 const BLOCK_CACHE_SIZE: usize = 512;
 
 struct BlockCacheInner {
-    device: Rc<dyn BlockDevice>,
+    device: Arc<dyn BlockDevice>,
     block_id: usize,
     size: usize,
     dirty: bool,
@@ -31,7 +31,7 @@ unsafe impl Sync for BlockCache {}
 unsafe impl Send for BlockCache {}
 
 impl BlockCache {
-    pub fn new(block_id: usize, size: usize, device: Rc<dyn BlockDevice>) -> Self {
+    pub fn new(block_id: usize, size: usize, device: Arc<dyn BlockDevice>) -> Self {
         let data = unsafe { alloc::alloc(Layout::from_size_align(size, 8).unwrap()) };
         device.read_block(block_id, unsafe { slice::from_raw_parts_mut(data, size) });
         Self {
@@ -211,7 +211,7 @@ impl Drop for BlockCache {
 }
 
 pub struct BlockCacheManager {
-    queue: RefCell<VecDeque<(usize, Rc<dyn Buffer>)>>,
+    queue: RefCell<VecDeque<(usize, Arc<dyn Buffer>)>>,
 }
 
 impl BlockCacheManager {
@@ -223,10 +223,10 @@ impl BlockCacheManager {
 }
 
 impl BufferProvider for BlockCacheManager {
-    fn get_buffer(&self, dev: &Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>> {
+    fn get_buffer(&self, dev: &Arc<dyn BlockDevice>, block_id: usize) -> Option<Arc<dyn Buffer>> {
         let mut queue = self.queue.borrow_mut();
         if let Some(pair) = queue.iter().find(|pair| pair.0 == block_id) {
-            Some(Rc::clone(&pair.1))
+            Some(Arc::clone(&pair.1))
         } else {
             // substitute
             if queue.len() == BLOCK_CACHE_SIZE {
@@ -234,7 +234,7 @@ impl BufferProvider for BlockCacheManager {
                 if let Some((idx, _)) = queue
                     .iter()
                     .enumerate()
-                    .find(|(_, pair)| Rc::strong_count(&pair.1) == 1)
+                    .find(|(_, pair)| Arc::strong_count(&pair.1) == 1)
                 {
                     queue.drain(idx..=idx);
                 } else {
@@ -242,14 +242,14 @@ impl BufferProvider for BlockCacheManager {
                 }
             }
             // load block into mem and push back
-            let block_cache = BlockCache::new(block_id, dev.block_size(), Rc::clone(&dev));
-            let block_cache: Rc<dyn Buffer> = Rc::new(block_cache);
-            queue.push_back((block_id, Rc::clone(&block_cache)));
+            let block_cache = BlockCache::new(block_id, dev.block_size(), Arc::clone(&dev));
+            let block_cache: Arc<dyn Buffer> = Arc::new(block_cache);
+            queue.push_back((block_id, Arc::clone(&block_cache)));
             Some(block_cache)
         }
     }
 
-    fn sync(&self, dev: &Rc<dyn BlockDevice>, buf: Rc<dyn Buffer>) {
+    fn sync(&self, dev: &Arc<dyn BlockDevice>, buf: Arc<dyn Buffer>) {
         dev.write_block(buf.block_id(), unsafe {
             slice::from_raw_parts_mut(buf.data(), buf.size())
         });
