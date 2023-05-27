@@ -27,7 +27,7 @@ impl Journal {
             let jb_rc = tx.checkpoint_list.0[0].clone();
             let jb = jb_rc.borrow();
             tx.checkpoint_list.0.remove(0);
-            jb.buf.sync();
+            self.sync_buffer(jb.buf.clone());
         }
 
         self.checkpoint_transactions.remove(0);

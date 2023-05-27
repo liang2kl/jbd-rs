@@ -1,5 +1,4 @@
 //! The system abstraction layer.
-// TODO: jbd_alloc, jbd_free
 use core::{any::Any, cell::RefCell};
 extern crate alloc;
 use alloc::{boxed::Box, rc::Rc};
@@ -16,7 +15,7 @@ pub trait BlockDevice: Any {
 }
 
 pub trait Buffer: Any {
-    fn device(&self) -> Rc<dyn BlockDevice>;
+    // fn device(&self) -> Rc<dyn BlockDevice>;
     fn block_id(&self) -> usize;
     fn size(&self) -> usize;
     fn dirty(&self) -> bool;
@@ -31,7 +30,6 @@ pub trait Buffer: Any {
     fn mark_dirty(&self);
     fn clear_dirty(&self);
     fn test_clear_dirty(&self) -> bool;
-    fn sync(&self);
 
     // JBD-specific state management. The related states should only
     // be altered by JBD.
@@ -87,7 +85,7 @@ impl dyn Buffer {
 
 pub trait BufferProvider: Any {
     fn get_buffer(&self, dev: &Rc<dyn BlockDevice>, block_id: usize) -> Option<Rc<dyn Buffer>>;
-    fn sync(&self) -> bool;
+    fn sync(&self, dev: &Rc<dyn BlockDevice>, buf: Rc<dyn Buffer>);
 }
 
 pub trait System: Any {

@@ -543,6 +543,8 @@ impl Handle {
         let mut jb = jb_rc.borrow_mut();
         let tx_rc = &self.transaction.as_ref().unwrap();
         let mut tx = tx_rc.borrow_mut();
+        let journal_rc = tx.journal.upgrade().unwrap();
+        let journal = &journal_rc.as_ref().borrow();
 
         // What if the buffer is already part of a running transaction?
         //
@@ -579,8 +581,10 @@ impl Handle {
 
                 if buf.dirty() {
                     // write back synchronously
-                    buf.sync();
-                    // TODO: if !buffer_mapped
+                    journal
+                        .system
+                        .get_buffer_provider()
+                        .sync(&journal.devs.dev, buf.clone());
                 }
                 // TODO: if (unlikely(!buffer_uptodate(bh)))
                 if let Some(jb_tx) = &jb.transaction {

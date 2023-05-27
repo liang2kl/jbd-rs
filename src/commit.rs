@@ -189,7 +189,7 @@ impl Journal {
 
                 for buf in self.wbuf.iter() {
                     buf.mark_dirty();
-                    buf.sync();
+                    self.sync_buffer(buf.clone());
                 }
                 self.wbuf.clear();
 
@@ -296,7 +296,7 @@ impl Journal {
         header.sequence = (commit_tx.tid as u32).to_be();
 
         descriptor.buf.mark_dirty();
-        descriptor.buf.sync();
+        self.sync_buffer(descriptor.buf.clone());
 
         Ok(())
     }
@@ -368,7 +368,7 @@ impl Journal {
             assert!(buf.jbd_managed());
 
             if buf.test_clear_dirty() {
-                buf.sync();
+                self.sync_buffer(buf.clone());
                 Transaction::file_buffer(tx_rc, tx, &jb_rc, &mut jb, BufferListType::Locked)?;
             } else {
                 Transaction::unfile_buffer(&jb_rc, &mut jb, tx);

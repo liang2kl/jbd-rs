@@ -62,10 +62,6 @@ impl BlockCache {
 }
 
 impl Buffer for BlockCache {
-    fn device(&self) -> Rc<dyn BlockDevice> {
-        self.inner_mut().device.clone()
-    }
-
     fn block_id(&self) -> usize {
         self.inner().block_id
     }
@@ -111,20 +107,6 @@ impl Buffer for BlockCache {
     fn clear_dirty(&self) {
         self.inner_mut().dirty = false;
         log::trace!("Cleared block {} dirty", self.block_id());
-    }
-
-    fn sync(&self) {
-        let inner = self.inner();
-        if inner.dirty {
-            unsafe {
-                inner
-                    .device
-                    .write_block(inner.block_id, slice::from_raw_parts_mut(inner.data, inner.size));
-            }
-        }
-        drop(inner);
-        self.clear_dirty();
-        log::trace!("Synced block {}", self.block_id());
     }
 
     fn mark_jbd_dirty(&self) {
@@ -225,7 +207,6 @@ impl Drop for BlockCache {
                 Layout::from_size_align(self.inner().size, 8).unwrap(),
             );
         }
-        self.sync();
     }
 }
 
@@ -268,11 +249,11 @@ impl BufferProvider for BlockCacheManager {
         }
     }
 
-    fn sync(&self) -> bool {
-        let queue = self.queue.borrow();
-        for (_, buf) in queue.iter() {
-            buf.sync();
-        }
-        true
+    fn sync(&self, dev: &Rc<dyn BlockDevice>, buf: Rc<dyn Buffer>) {
+        dev.write_block(buf.block_id(), unsafe {
+            slice::from_raw_parts_mut(buf.data(), buf.size())
+        });
+        buf.clear_dirty();
+        log::trace!("Synced block {}", buf.block_id());
     }
 }

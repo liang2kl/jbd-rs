@@ -46,7 +46,7 @@ pub struct Journal {
     /// List of all transactions waiting for checkpointing
     pub checkpoint_transactions: Vec<Rc<RefCell<Transaction>>>,
     /// Block devices
-    pub devs: JournalDevs,
+    pub(crate) devs: JournalDevs,
     /// Total maximum capacity of the journal region on disk
     pub maxlen: u32,
     /// Maximum number of metadata buffers to allow in a single compound
@@ -70,10 +70,10 @@ bitflags! {
     }
 }
 
-pub struct JournalDevs {
-    dev: Rc<dyn BlockDevice>,
-    blk_offset: u32,
-    fs_dev: Rc<dyn BlockDevice>,
+pub(crate) struct JournalDevs {
+    pub(crate) dev: Rc<dyn BlockDevice>,
+    pub(crate) blk_offset: u32,
+    pub(crate) fs_dev: Rc<dyn BlockDevice>,
 }
 
 /// Journal states protected by a single spin lock in Linux.
@@ -167,10 +167,10 @@ impl Journal {
             let page_head = self.get_buffer(block_id)?;
             let buf = page_head.buf_mut();
             buf.fill(0);
+            self.sync_buffer(page_head);
         }
 
         // FIXME
-        self.sync_buf()?;
         log::debug!("Journal cleared.");
 
         let sb = self.superblock_mut();
@@ -318,7 +318,7 @@ impl Journal {
         sb.start = self.tail.to_be();
         sb.errno = self.errno.to_be();
 
-        self.sb_buffer.sync();
+        self.sync_buffer(self.sb_buffer.clone());
 
         #[cfg(feature = "debug")]
         log::debug!("Superblock after update: {}", sb.display(0));
@@ -384,12 +384,8 @@ impl Journal {
             .map_or(Err(JBDError::IOError), |bh| Ok(bh))
     }
 
-    fn sync_buf(&mut self) -> JBDResult {
-        if self.system.get_buffer_provider().sync() {
-            Ok(())
-        } else {
-            Err(JBDError::IOError)
-        }
+    pub(crate) fn sync_buffer(&self, buffer: Rc<dyn Buffer>) {
+        self.system.get_buffer_provider().sync(&self.devs.dev, buffer);
     }
 
     /// Start a new transaction in the journal, equivalent to get_transaction()
