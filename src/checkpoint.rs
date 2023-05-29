@@ -13,10 +13,10 @@ impl Journal {
     pub fn log_do_checkpoint(&mut self) -> bool {
         log::debug!("Start checkpoint.");
 
-        let cleaned = self.cleanup_tail();
+        self.cleanup_tail();
 
         // Start writing disk blocks
-        if self.checkpoint_transactions.is_empty() || cleaned {
+        if self.checkpoint_transactions.is_empty() {
             return false;
         }
 
@@ -35,7 +35,7 @@ impl Journal {
         true
     }
 
-    fn cleanup_tail(&mut self) -> bool {
+    fn cleanup_tail(&mut self) {
         let (first_tid, blocknr) = if !self.checkpoint_transactions.is_empty() {
             let tx_rc = &self.checkpoint_transactions[0];
             let tx = tx_rc.borrow();
@@ -60,7 +60,7 @@ impl Journal {
         );
 
         if self.tail_sequence == first_tid {
-            return true;
+            return;
         }
 
         assert!(first_tid > self.tail_sequence);
@@ -77,7 +77,5 @@ impl Journal {
         if !self.flags.contains(JournalFlag::ABORT) {
             self.update_superblock();
         }
-
-        false
     }
 }

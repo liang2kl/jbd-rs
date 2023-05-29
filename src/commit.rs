@@ -84,7 +84,7 @@ impl Journal {
         }
 
         // TODO: write revoke records
-        self.write_revoke_records(&commit_tx_rc, &mut commit_tx);
+        self.write_revoke_records(&commit_tx_rc, &mut commit_tx)?;
 
         assert!(commit_tx.sync_datalist.0.is_empty());
 
@@ -235,7 +235,6 @@ impl Journal {
         assert!(commit_tx.shadow_list.0.is_empty());
         assert!(commit_tx.log_list.0.is_empty());
 
-        // TODO: Checkpoints
         let forget_list = commit_tx.forget.0.clone();
 
         for jb_rc in forget_list.into_iter() {
@@ -250,7 +249,19 @@ impl Journal {
                 jb.frozen_data = None;
             }
 
-            assert!(jb.cp_transaction.is_none());
+            if let Some(cp_tx_rc) = &jb.cp_transaction {
+                // Remove from checkpoint
+                let cp_tx_rc = cp_tx_rc.upgrade().unwrap();
+                if Arc::ptr_eq(&cp_tx_rc, &commit_tx_rc) {
+                    commit_tx.checkpoint_list.0.retain(|x| !Arc::ptr_eq(x, &jb_rc));
+                } else {
+                    let mut tx = cp_tx_rc.as_ref().borrow_mut();
+                    tx.checkpoint_list.0.retain(|x| !Arc::ptr_eq(x, &jb_rc));
+                }
+
+                jb.cp_transaction = None;
+            }
+
             assert!(jb.next_transaction.is_none());
             let buf = &jb.buf;
 
@@ -335,6 +346,10 @@ impl Journal {
 
             jb.frozen_data = Some(new_data);
             done_copy_out = true;
+        } else {
+            // A little hack here
+            let new_jb = new_jb_rc.as_ref().borrow_mut();
+            new_jb.buf.buf_mut().copy_from_slice(data);
         }
 
         if do_escape {

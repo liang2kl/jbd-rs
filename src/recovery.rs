@@ -1,4 +1,17 @@
-use crate::{err::JBDResult, tx::Tid, Journal};
+extern crate alloc;
+
+use core::mem::size_of;
+
+use alloc::sync::Arc;
+
+use crate::{
+    config::JFS_MAGIC_NUMBER,
+    disk::{BlockTag, BlockType, Header, RevokeBlockHeader, TagFlag},
+    err::{JBDError, JBDResult},
+    sal::Buffer,
+    tx::Tid,
+    Journal,
+};
 
 pub struct RecoveryInfo {
     start_transcation: Tid,
@@ -21,6 +34,7 @@ impl RecoveryInfo {
     }
 }
 
+#[derive(PartialEq, Eq, Debug)]
 pub enum PassType {
     Scan,
     Revoke,
@@ -29,7 +43,7 @@ pub enum PassType {
 
 impl Journal {
     pub fn recover(&mut self) -> JBDResult {
-        let mut sb = self.superblock_mut();
+        let sb = self.superblock_ref();
 
         // If sb.start == 0, the journal has already been safely unmounted.
         if sb.start == 0 {
@@ -43,7 +57,23 @@ impl Journal {
         self.do_one_pass(&mut info, PassType::Revoke)?;
         self.do_one_pass(&mut info, PassType::Replay)?;
 
-        todo!();
+        log::debug!(
+            "Recovery complete, recovered transactions {} to {}",
+            info.start_transcation,
+            info.end_transaction
+        );
+
+        log::debug!(
+            "Recovery stats: {} replayed, {} revoked, {} revoke hits",
+            info.num_replays,
+            info.num_revokes,
+            info.num_revoke_hits
+        );
+
+        info.end_transaction += 1;
+        self.transaction_sequence = info.end_transaction;
+
+        self.clear_revoke();
 
         Ok(())
     }
@@ -51,6 +81,177 @@ impl Journal {
 
 impl Journal {
     fn do_one_pass(&mut self, info: &mut RecoveryInfo, pass_type: PassType) -> JBDResult {
+        let sb = self.superblock_mut();
+        let mut next_commit_id = u32::from_be(sb.sequence);
+        let mut next_log_block = u32::from_be(sb.start);
+        let first_commit_id = next_commit_id;
+
+        if pass_type == PassType::Scan {
+            info.start_transcation = first_commit_id as u16;
+        }
+
+        log::debug!("Start recovery pass {:?}", pass_type);
+
+        // Now we walk through the log, transaction by transaction,
+        // making sure that each transaction has a commit block in the
+        // expected place.  Each complete transaction gets replayed back
+        // into the main filesystem.
+
+        loop {
+            if pass_type != PassType::Scan && next_commit_id >= info.end_transaction as u32 {
+                break;
+            }
+            log::debug!(
+                "Scanning for sequence {} at {}/{}",
+                next_commit_id,
+                next_log_block,
+                self.last
+            );
+
+            let buf = self.read_block(next_log_block)?;
+
+            next_log_block = self.wrap(next_log_block + 1);
+
+            let header: &Header = buf.convert();
+            if header.magic != JFS_MAGIC_NUMBER.to_be() {
+                // Reach the end of the log
+                break;
+            }
+
+            let block_type = BlockType::from_u32_be(header.block_type)?;
+            let sequence = u32::from_be(header.sequence);
+            log::debug!("Found block type {:?}, sequence {}", block_type, sequence);
+
+            if sequence != next_commit_id {
+                // Reach the end of the log
+                break;
+            }
+
+            match block_type {
+                BlockType::DescriptorBlock => {
+                    if pass_type != PassType::Replay {
+                        // Just skip the blocks it describes
+                        next_log_block = self.wrap(next_log_block + count_tags(&buf, buf.size()));
+                        continue;
+                    }
+                    let mut offset = size_of::<Header>();
+                    while offset < buf.size() {
+                        let tag = buf.convert_offset::<BlockTag>(offset);
+                        let flag = TagFlag::from_bits_truncate(u32::from_be(tag.flag));
+
+                        let io_block = next_log_block;
+                        next_log_block = self.wrap(next_log_block + 1);
+                        let buf = self.read_block(io_block)?;
+
+                        let blocknr = u32::from_be(tag.block_nr);
+                        if self.test_revoke(blocknr, next_commit_id as Tid) {
+                            log::debug!("Replay: skipping revoked block {}", blocknr);
+                            info.num_revoke_hits += 1;
+                        } else {
+                            log::debug!("Replay: replaying block {}", blocknr);
+
+                            let new_buf = self.get_buffer(blocknr)?;
+                            new_buf.buf_mut().copy_from_slice(buf.buf());
+
+                            if flag.contains(TagFlag::ESCAPE) {
+                                new_buf.buf_mut()[..4].copy_from_slice(&u32::to_be_bytes(JFS_MAGIC_NUMBER));
+                            }
+                            self.sync_buffer(new_buf);
+
+                            info.num_replays += 1;
+                        }
+
+                        offset += size_of::<BlockTag>();
+                        if !flag.contains(TagFlag::SAME_UUID) {
+                            offset += 16;
+                        }
+                        if flag.contains(TagFlag::LAST_TAG) {
+                            break;
+                        }
+                    }
+                }
+                BlockType::CommitBlock => {
+                    next_commit_id += 1;
+                }
+                BlockType::RevokeBlock => {
+                    if pass_type != PassType::Revoke {
+                        continue;
+                    }
+                    self.scan_revoke_records(&buf, next_commit_id as Tid, info)?
+                }
+                _ => {
+                    log::error!("Unrecognized block type {:?} in journal", block_type);
+                    break;
+                }
+            }
+        }
+
+        if pass_type == PassType::Scan {
+            info.end_transaction = next_commit_id as u16;
+        } else if info.end_transaction != next_commit_id as u16 {
+            log::error!(
+                "Recovery pass {:?} ended at transaction {}, expected {}",
+                pass_type,
+                next_commit_id,
+                info.end_transaction
+            );
+            return Err(JBDError::IOError);
+        }
+
         Ok(())
     }
+
+    fn read_block(&self, offset: u32) -> JBDResult<Arc<dyn Buffer>> {
+        if offset >= self.maxlen {
+            log::error!("Corrupted journal superblock");
+            return Err(JBDError::InvalidSuperblock);
+        }
+
+        self.get_buffer(offset)
+    }
+
+    fn scan_revoke_records(&mut self, buf: &Arc<dyn Buffer>, sequence: Tid, info: &mut RecoveryInfo) -> JBDResult {
+        let header = buf.convert::<RevokeBlockHeader>();
+        let mut offset = size_of::<RevokeBlockHeader>();
+        let max = u32::from_be(header.count) as usize;
+
+        while offset < max {
+            let blocknr = u32::from_be(*buf.convert_offset::<u32>(offset));
+            offset += 4;
+            self.set_revoke(blocknr, sequence);
+            info.num_revokes += 1;
+        }
+
+        Ok(())
+    }
+
+    fn wrap(&self, block: u32) -> u32 {
+        if block >= self.last {
+            block - (self.last - self.first)
+        } else {
+            block
+        }
+    }
+}
+
+fn count_tags(buf: &Arc<dyn Buffer>, size: usize) -> u32 {
+    let mut offset = size_of::<Header>();
+    let mut num = 0;
+
+    while offset <= size {
+        let tag = buf.convert_offset::<BlockTag>(offset as usize);
+
+        num += 1;
+        offset += size_of::<BlockTag>();
+
+        let flag = TagFlag::from_bits_truncate(u32::from_be(tag.flag));
+        if !flag.contains(TagFlag::SAME_UUID) {
+            offset += 16;
+        }
+        if flag.contains(TagFlag::LAST_TAG) {
+            break;
+        }
+    }
+
+    num
 }

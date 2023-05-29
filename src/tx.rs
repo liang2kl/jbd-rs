@@ -658,11 +658,14 @@ impl Handle {
     ///
     /// Allow this call even if the handle has aborted --- it may be part of
     /// the caller's cleanup after an abort.
-    pub(crate) fn forget(&mut self, buf: &Arc<dyn Buffer>) -> JBDResult {
+    pub(crate) fn forget(
+        &mut self,
+        buf: &Arc<dyn Buffer>,
+        tx_rc: &Arc<RefCell<Transaction>>,
+        tx: &mut Transaction,
+    ) -> JBDResult {
         let jb_rc = JournalBuffer::new_or_get(buf);
         let mut jb = jb_rc.borrow_mut();
-        let tx_rc = self.transaction.clone().unwrap();
-        let mut tx = tx_rc.borrow_mut();
 
         if !buf.jbd_managed() {
             return Ok(());
@@ -689,10 +692,10 @@ impl Handle {
             }
 
             if jb.cp_transaction.is_some() {
-                Transaction::temp_unlink_buffer(&mut tx, &jb_rc, &mut jb);
-                Transaction::file_buffer(&tx_rc, &mut tx, &jb_rc, &mut jb, BufferListType::Forget)?;
+                Transaction::temp_unlink_buffer(tx, &jb_rc, &mut jb);
+                Transaction::file_buffer(&tx_rc, tx, &jb_rc, &mut jb, BufferListType::Forget)?;
             } else {
-                todo!("unfile_buffer")
+                Transaction::unfile_buffer(&jb_rc, &mut jb, tx);
             }
         } else if jb.transaction.is_some() {
             // Belongs to older transaction

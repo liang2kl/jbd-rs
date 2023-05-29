@@ -1,12 +1,18 @@
 pub mod mock;
 pub mod sal;
 
-use std::{cell::RefCell, sync::Arc};
+use std::{borrow::BorrowMut, cell::RefCell, sync::Arc};
 
 use jbd_rs::{self, err::JBDResult, Handle, Journal};
 use sal::UserSystem;
 
 pub const JOURNAL_SIZE: usize = 1024;
+
+pub fn existing_journal(system: Arc<UserSystem>) -> Arc<RefCell<Journal>> {
+    let dev = system.block_device();
+    let journal = Journal::init_dev(system.clone(), dev.clone(), dev.clone(), 0, JOURNAL_SIZE as u32).unwrap();
+    Arc::new(RefCell::new(journal))
+}
 
 pub fn create_journal() -> JBDResult<(Arc<UserSystem>, Arc<RefCell<Journal>>)> {
     const NBLOCKS: usize = 2048;

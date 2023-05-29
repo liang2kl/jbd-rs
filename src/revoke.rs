@@ -9,7 +9,7 @@ use crate::{
     err::{JBDError, JBDResult},
     journal::JournalFlag,
     sal::Buffer,
-    tx::{BufferListType, JournalBuffer, Tid, Transaction},
+    tx::{JournalBuffer, Tid, Transaction},
     Handle, Journal,
 };
 
@@ -22,7 +22,7 @@ pub(crate) struct RevokeRecord {
 impl Handle {
     pub fn revoke(&mut self, buf: &Arc<dyn Buffer>) -> JBDResult {
         let transcation_rc = self.transaction.as_ref().unwrap().clone();
-        let transaction = transcation_rc.as_ref().borrow_mut();
+        let mut transaction = transcation_rc.as_ref().borrow_mut();
         let journal_rc = transaction.journal.upgrade().unwrap();
         let mut journal = journal_rc.as_ref().borrow_mut();
 
@@ -34,7 +34,7 @@ impl Handle {
         buf.set_revoked();
         buf.set_revoke_valid();
 
-        self.forget(buf)?;
+        self.forget(buf, &transcation_rc, &mut transaction)?;
 
         journal.insert_revoke_record(buf.block_id() as u32, transaction.tid);
 
@@ -148,19 +148,20 @@ impl Journal {
 
         if descriptor_rc.is_none() {
             *descriptor_rc = Some(self.get_descriptor_buffer()?);
-            let mut descriptor = descriptor_rc.as_ref().unwrap().as_ref().borrow_mut();
+            let descriptor = descriptor_rc.as_ref().unwrap().as_ref().borrow_mut();
             let mut header: &mut Header = descriptor.buf.convert_mut();
             header.magic = JFS_MAGIC_NUMBER.to_be();
-            header.block_type = BlockType::Revokeblock.to_u32_be();
+            header.block_type = BlockType::RevokeBlock.to_u32_be();
             header.sequence = (transaction.tid as u32).to_be();
 
-            Transaction::file_buffer(
-                transaction_rc,
-                transaction,
-                descriptor_rc.as_ref().unwrap(),
-                &mut descriptor,
-                BufferListType::LogCtl,
-            )?;
+            // Transaction::file_buffer(
+            //     transaction_rc,
+            //     transaction,
+            //     descriptor_rc.as_ref().unwrap(),
+            //     &mut descriptor,
+            //     BufferListType::LogCtl,
+            // )?;
+            self.sync_buffer(descriptor.buf.clone());
 
             *offset = size_of::<RevokeBlockHeader>() as u32;
         }
@@ -179,6 +180,24 @@ impl Journal {
                 buf.clear_revoked();
             }
         }
+    }
+
+    pub(crate) fn clear_revoke(&mut self) {
+        self.get_revoke_table_mut().clear();
+    }
+
+    pub(crate) fn set_revoke(&mut self, blocknr: u32, sequence: Tid) {
+        let revoke_table = self.get_revoke_table_mut();
+        revoke_table
+            .entry(blocknr)
+            .and_modify(|rec| rec.sequence = sequence.max(rec.sequence))
+            .or_insert(RevokeRecord { sequence, blocknr });
+    }
+
+    pub(crate) fn test_revoke(&self, blocknr: u32, sequence: Tid) -> bool {
+        self.get_revoke_table()
+            .get(&blocknr)
+            .map_or(false, |rec| rec.sequence >= sequence)
     }
 
     fn flush_descriptor(&mut self, descriptor: &JournalBuffer, offset: u32) {

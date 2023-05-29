@@ -194,7 +194,7 @@ impl Journal {
     pub fn load(&mut self) -> JBDResult {
         self.load_superblock()?;
 
-        // TODO: self.recover()?;
+        self.recover()?;
         self.reset()?;
 
         self.flags.remove(JournalFlag::ABORT);
@@ -290,6 +290,9 @@ impl Journal {
         let first = u32::from_be(sb.first);
         let last = u32::from_be(sb.maxlen);
         let errno = i32::from_be(sb.errno);
+
+        #[cfg(feature = "debug")]
+        log::debug!("Loaded superblock: {}", sb.display(0));
 
         drop(sb);
 
@@ -396,7 +399,7 @@ impl Journal {
             tx_mut.state = TransactionState::Running;
             tx_mut.start_time = self.system.get_time();
             // FIXME
-            tx_mut.tid = self.transaction_sequence + 1;
+            tx_mut.tid = self.transaction_sequence;
         }
         self.transaction_sequence += 1;
         // TODO: tx.expires

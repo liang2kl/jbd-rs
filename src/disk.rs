@@ -10,13 +10,13 @@ use cfg_if::cfg_if;
 use crate::err::{JBDError, JBDResult};
 
 /// Descriptor block types.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum BlockType {
     DescriptorBlock = 1,
     CommitBlock = 2,
     SuperblockV1 = 3,
     SuperblockV2 = 4,
-    Revokeblock = 5,
+    RevokeBlock = 5,
 }
 
 impl BlockType {
@@ -27,7 +27,7 @@ impl BlockType {
             2 => Ok(BlockType::CommitBlock),
             3 => Ok(BlockType::SuperblockV1),
             4 => Ok(BlockType::SuperblockV2),
-            5 => Ok(BlockType::Revokeblock),
+            5 => Ok(BlockType::RevokeBlock),
             _ => Err(JBDError::InvalidSuperblock),
         }
     }
@@ -38,7 +38,7 @@ impl BlockType {
             BlockType::CommitBlock => 2,
             BlockType::SuperblockV1 => 3,
             BlockType::SuperblockV2 => 4,
-            BlockType::Revokeblock => 5,
+            BlockType::RevokeBlock => 5,
         } as u32;
         val.to_be()
     }
@@ -147,7 +147,7 @@ impl Display for BlockType {
             BlockType::CommitBlock => "CommitBlock".to_string(),
             BlockType::SuperblockV1 => "SuperblockV1".to_string(),
             BlockType::SuperblockV2 => "SuperblockV2".to_string(),
-            BlockType::Revokeblock => "Revokeblock".to_string(),
+            BlockType::RevokeBlock => "Revokeblock".to_string(),
         }
     }
 }
