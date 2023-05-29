@@ -65,9 +65,18 @@ impl dyn Buffer {
         unsafe { &*(self.data() as *const T) }
     }
 
+    pub(crate) fn convert_offset<T>(&self, offset: usize) -> &T {
+        unsafe { &*((self.data() as usize + offset) as *const T) }
+    }
+
     pub(crate) fn convert_mut<T>(&self) -> &mut T {
         self.mark_dirty();
         unsafe { &mut *(self.data() as *mut T) }
+    }
+
+    pub(crate) fn convert_offset_mut<T>(&self, offset: usize) -> &mut T {
+        self.mark_dirty();
+        unsafe { &mut *((self.data() as usize + offset) as *mut T) }
     }
 
     pub(crate) fn journal_buffer(&self) -> Option<Arc<RefCell<JournalBuffer>>> {

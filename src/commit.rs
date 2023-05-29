@@ -84,7 +84,7 @@ impl Journal {
         }
 
         // TODO: write revoke records
-        self.write_revoke_records(&commit_tx);
+        self.write_revoke_records(&commit_tx_rc, &mut commit_tx);
 
         assert!(commit_tx.sync_datalist.0.is_empty());
 
@@ -119,8 +119,7 @@ impl Journal {
                 let buf = &descriptor.buf;
                 let header: &mut Header = buf.convert_mut();
                 header.magic = JFS_MAGIC_NUMBER.to_be();
-                let block_type_host: u32 = BlockType::DescriptorBlock.into();
-                header.block_type = block_type_host.to_be();
+                header.block_type = BlockType::DescriptorBlock.to_u32_be();
                 header.sequence = (commit_tx.tid as u32).to_be();
 
                 buf.mark_dirty();
@@ -291,8 +290,7 @@ impl Journal {
         let descriptor = descriptor_rc.as_ref().borrow_mut();
         let header: &mut Header = descriptor.buf.convert_mut();
         header.magic = JFS_MAGIC_NUMBER.to_be();
-        let block_type_host: u32 = BlockType::CommitBlock.into();
-        header.block_type = block_type_host.to_be();
+        header.block_type = BlockType::CommitBlock.to_u32_be();
         header.sequence = (commit_tx.tid as u32).to_be();
 
         descriptor.buf.mark_dirty();
@@ -378,7 +376,7 @@ impl Journal {
         Ok(())
     }
 
-    fn get_descriptor_buffer(&mut self) -> JBDResult<Arc<RefCell<JournalBuffer>>> {
+    pub(crate) fn get_descriptor_buffer(&mut self) -> JBDResult<Arc<RefCell<JournalBuffer>>> {
         let blocknr = self.next_log_block();
         let buf = self.get_buffer(blocknr)?;
         buf.buf_mut().fill(0);

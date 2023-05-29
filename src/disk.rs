@@ -19,16 +19,10 @@ pub enum BlockType {
     Revokeblock = 5,
 }
 
-impl Into<u32> for BlockType {
-    fn into(self) -> u32 {
-        self as u32
-    }
-}
-
-impl TryFrom<u32> for BlockType {
-    type Error = JBDError;
-    fn try_from(value: u32) -> JBDResult<Self> {
-        match value {
+impl BlockType {
+    pub fn from_u32_be(block_type: u32) -> JBDResult<Self> {
+        let block_type = u32::from_be(block_type);
+        match block_type {
             1 => Ok(BlockType::DescriptorBlock),
             2 => Ok(BlockType::CommitBlock),
             3 => Ok(BlockType::SuperblockV1),
@@ -36,6 +30,17 @@ impl TryFrom<u32> for BlockType {
             5 => Ok(BlockType::Revokeblock),
             _ => Err(JBDError::InvalidSuperblock),
         }
+    }
+
+    pub fn to_u32_be(&self) -> u32 {
+        let val = match self {
+            BlockType::DescriptorBlock => 1,
+            BlockType::CommitBlock => 2,
+            BlockType::SuperblockV1 => 3,
+            BlockType::SuperblockV2 => 4,
+            BlockType::Revokeblock => 5,
+        } as u32;
+        val.to_be()
     }
 }
 

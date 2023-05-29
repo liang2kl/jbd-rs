@@ -176,7 +176,7 @@ impl Journal {
         let sb = self.superblock_mut();
 
         sb.header.magic = JFS_MAGIC_NUMBER.to_be();
-        sb.header.block_type = <BlockType as Into<u32>>::into(BlockType::SuperblockV2).to_be();
+        sb.header.block_type = BlockType::SuperblockV2.to_u32_be();
 
         sb.block_size = (self.devs.dev.block_size() as u32).to_be();
         sb.maxlen = self.maxlen.to_be();
@@ -340,7 +340,7 @@ impl Journal {
             return Err(JBDError::InvalidSuperblock);
         }
 
-        let block_type: BlockType = u32::from_be(sb.header.block_type).try_into()?;
+        let block_type = BlockType::from_u32_be(sb.header.block_type)?;
 
         drop(sb);
 
