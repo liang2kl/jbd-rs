@@ -169,7 +169,7 @@ impl Display for TagFlag {
 impl Display for Header {
     fn display(&self, ident: usize) -> String {
         let ident_str = get_ident(ident);
-        let block_type = BlockType::try_from(u32::from_be(self.block_type)).unwrap();
+        let block_type = BlockType::from_u32_be(self.block_type).unwrap();
         format_args!(
             "{}magic: {:x}{}block_type: {}{}sequence: {}",
             &ident_str,
