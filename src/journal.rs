@@ -73,6 +73,7 @@ bitflags! {
 pub(crate) struct JournalDevs {
     pub(crate) dev: Arc<dyn BlockDevice>,
     pub(crate) blk_offset: u32,
+    #[allow(unused)]
     pub(crate) fs_dev: Arc<dyn BlockDevice>,
 }
 

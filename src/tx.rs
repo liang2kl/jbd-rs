@@ -5,7 +5,7 @@ use core::cell::RefCell;
 
 use crate::{
     err::{JBDError, JBDResult},
-    journal::{start_handle, Journal},
+    journal::Journal,
     sal::Buffer,
 };
 use alloc::{sync::Arc, sync::Weak, vec::Vec};
@@ -18,6 +18,7 @@ pub(crate) enum BufferListType {
     Forget,
     IO,
     Shadow,
+    #[allow(unused)]
     LogCtl,
     Reserved,
     Locked,
@@ -407,34 +408,6 @@ impl Handle {
 
         Ok(())
     }
-
-    /// Restart a handle for a multi-transaction filesystem
-    /// operation.
-    ///
-    /// If the Handle::extend() call above fails to grant new buffer credits
-    /// to a running handle, a call to journal_restart will commit the
-    /// handle's transaction so far and reattach the handle to a new
-    /// transaction capabable of guaranteeing the requested number of
-    /// credits.
-    pub fn restart(&mut self, nblocks: u32) -> JBDResult {
-        if self.aborted {
-            return Ok(());
-        }
-
-        let mut tx = self.transaction.as_ref().unwrap().borrow_mut();
-        let journal_rc = tx.journal.upgrade().unwrap();
-        let journal = &journal_rc.as_ref().borrow();
-
-        tx.outstanding_credits -= self.buffer_credits;
-        tx.updates -= 1;
-
-        // TODO: updates == 0
-        log::debug!("Restarted handle");
-        todo!("__log_start_commit");
-
-        self.buffer_credits = nblocks;
-        start_handle(&mut journal_rc, &mut self);
-    }
 }
 
 // Buffer managements
@@ -482,7 +455,7 @@ impl Handle {
             jb.next_transaction = Some(Arc::downgrade(&tx_rc));
         }
 
-        self.cancel_revoke(&jb_rc, &jb)?;
+        self.cancel_revoke(&jb)?;
 
         Ok(())
     }
@@ -830,7 +803,7 @@ impl Handle {
             }
         }
         // done:
-        self.cancel_revoke(jb_rc, jb)?;
+        self.cancel_revoke(jb)?;
 
         Ok(())
     }

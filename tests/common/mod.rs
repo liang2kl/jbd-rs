@@ -1,7 +1,7 @@
 pub mod mock;
 pub mod sal;
 
-use std::{borrow::BorrowMut, cell::RefCell, sync::Arc};
+use std::{cell::RefCell, sync::Arc};
 
 use jbd_rs::{self, err::JBDResult, Handle, Journal};
 use sal::UserSystem;

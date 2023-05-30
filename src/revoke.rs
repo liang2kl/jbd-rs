@@ -46,7 +46,7 @@ impl Handle {
         Ok(())
     }
 
-    pub(crate) fn cancel_revoke(&self, jb_rc: &Arc<RefCell<JournalBuffer>>, jb: &JournalBuffer) -> JBDResult {
+    pub(crate) fn cancel_revoke(&self, jb: &JournalBuffer) -> JBDResult {
         let buf = &jb.buf;
         let transaction_rc = jb.transaction.as_ref().unwrap().upgrade().unwrap();
         let transaction = transaction_rc.borrow();

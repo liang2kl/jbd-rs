@@ -1,14 +1,9 @@
-use std::{borrow::Borrow, cell::RefCell, slice, sync::Arc};
+use std::{slice, sync::Arc};
 
-use jbd_rs::{
-    sal::{BlockDevice, Buffer, System},
-    Journal,
-};
+use jbd_rs::sal::{BlockDevice, Buffer, System};
 use rand::Rng;
 
-use crate::common::{sal::dev::BLOCK_SIZE, JOURNAL_SIZE};
-
-use super::{create_handle, sal::UserSystem};
+use super::sal::UserSystem;
 
 pub fn write_random_block(system: &UserSystem, dev: &Arc<dyn BlockDevice>, block_id: usize) -> Arc<dyn Buffer> {
     let buf = system.get_buffer_provider().get_buffer(dev, block_id).unwrap();
