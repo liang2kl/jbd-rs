@@ -55,12 +55,13 @@ impl Journal {
         let mut info = RecoveryInfo::new();
         self.do_one_pass(&mut info, PassType::Scan)?;
         self.do_one_pass(&mut info, PassType::Revoke)?;
+        log::debug!("Recovery pass 1 complete, {} revokes", info.num_revokes);
         self.do_one_pass(&mut info, PassType::Replay)?;
 
         log::debug!(
             "Recovery complete, recovered transactions {} to {}",
             info.start_transcation,
-            info.end_transaction
+            info.end_transaction - 1
         );
 
         log::debug!(

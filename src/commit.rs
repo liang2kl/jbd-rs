@@ -83,8 +83,7 @@ impl Journal {
             }
         }
 
-        // TODO: write revoke records
-        self.write_revoke_records(&commit_tx_rc, &mut commit_tx)?;
+        self.write_revoke_records(&mut commit_tx)?;
 
         assert!(commit_tx.sync_datalist.0.is_empty());
 
@@ -157,7 +156,7 @@ impl Journal {
             space_left -= size_of::<BlockTag>();
 
             #[cfg(feature = "debug")]
-            log::debug!("Added block: {}", tag_mut.display(0));
+            log::debug!("Added block to descriptor: {}", tag_mut.display(0));
 
             unsafe {
                 *descriptor_buf_data.as_mut().unwrap() = descriptor_buf_data

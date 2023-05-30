@@ -26,21 +26,24 @@ fn test_revoke() {
     setup_logger();
     let (system, journal) = create_journal().unwrap();
 
-    let blocks_dist = Vec::from([
+    let blocks_dist = [
         [TestInfo::new(0, false), TestInfo::new(1, true)],
         [TestInfo::new(1, false), TestInfo::new(2, false)],
-        [TestInfo::new(2, false), TestInfo::new(3, true)],
-    ]);
-    let matches = [[true, false], [true, false], [true, true]];
+        [TestInfo::new(2, false), TestInfo::new(3, false)],
+        [TestInfo::new(3, true), TestInfo::new(3, false)],
+    ];
+    let matches = [[true, false], [true, false], [true, false], [false, true]];
     let mut original_data = Vec::new();
 
     let tx1_data = do_one_transaction(&system, journal.clone(), Vec::from(blocks_dist[0]));
     let tx2_data = do_one_transaction(&system, journal.clone(), Vec::from(blocks_dist[1]));
     let tx3_data = do_one_transaction(&system, journal.clone(), Vec::from(blocks_dist[2]));
+    let tx4_data = do_one_transaction(&system, journal.clone(), Vec::from(blocks_dist[3]));
 
     original_data.push(tx1_data);
     original_data.push(tx2_data);
     original_data.push(tx3_data);
+    original_data.push(tx4_data);
 
     // Recreate the journal without checkpointing the old one.
     let journal = existing_journal(system.clone());

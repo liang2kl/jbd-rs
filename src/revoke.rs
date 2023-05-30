@@ -13,6 +13,9 @@ use crate::{
     Handle, Journal,
 };
 
+#[cfg(feature = "debug")]
+use crate::disk::Display;
+
 #[derive(Clone, Copy)]
 pub(crate) struct RevokeRecord {
     sequence: Tid,
@@ -91,11 +94,7 @@ impl Journal {
         }
     }
 
-    pub(crate) fn write_revoke_records(
-        &mut self,
-        transaction_rc: &Arc<RefCell<Transaction>>,
-        transaction: &mut Transaction,
-    ) -> JBDResult {
+    pub(crate) fn write_revoke_records(&mut self, transaction: &mut Transaction) -> JBDResult {
         let mut descriptor_rc: Option<Arc<RefCell<JournalBuffer>>> = None;
 
         let revoke_table = if self.current_revoke_table == 0 {
@@ -112,12 +111,11 @@ impl Journal {
         let mut offset = 0;
 
         for (_, record) in revoke_table.into_iter() {
-            self.write_one_revoke_record(transaction_rc, transaction, &mut descriptor_rc, &mut offset, &record)?;
+            self.write_one_revoke_record(transaction, &mut descriptor_rc, &mut offset, &record)?;
         }
 
         if let Some(descriptor_rc) = descriptor_rc {
-            let descriptor = descriptor_rc.as_ref().borrow();
-            self.sync_buffer(descriptor.buf.clone());
+            self.flush_descriptor(&descriptor_rc.as_ref().borrow(), offset);
         }
 
         log::debug!("Wrote {} revoke records", count);
@@ -127,7 +125,6 @@ impl Journal {
 
     fn write_one_revoke_record(
         &mut self,
-        transaction_rc: &Arc<RefCell<Transaction>>,
         transaction: &mut Transaction,
         descriptor_rc: &mut Option<Arc<RefCell<JournalBuffer>>>,
         offset: &mut u32,
@@ -154,6 +151,9 @@ impl Journal {
             header.block_type = BlockType::RevokeBlock.to_u32_be();
             header.sequence = (transaction.tid as u32).to_be();
 
+            #[cfg(feature = "debug")]
+            log::debug!("Added descriptor: {}", header.display(0));
+
             // Transaction::file_buffer(
             //     transaction_rc,
             //     transaction,
@@ -166,10 +166,15 @@ impl Journal {
             *offset = size_of::<RevokeBlockHeader>() as u32;
         }
 
+        // FIXME: count?
+
         let descriptor = descriptor_rc.as_ref().unwrap().as_ref().borrow_mut();
         let blocknr = descriptor.buf.convert_offset_mut::<u32>(*offset as usize);
         *blocknr = record.blocknr;
         *offset += 4;
+
+        #[cfg(feature = "debug")]
+        log::debug!("Added revoke tag: {}", record.blocknr);
 
         Ok(())
     }
